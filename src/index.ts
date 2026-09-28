@@ -31,8 +31,31 @@ import {
   updateItem,
   verifiedCount,
 } from "./dod.js";
-import type { DodChecklist } from "./types.js";
-import { invokeCoverCheck, invokeGapAudit, invokeSpecAudit, type GapAuditResponse } from "./client.js";
+import type { DodChecklist, SpecAuditResponse } from "./types.js";
+import {
+  gapSystemPrompt,
+  invokeCoverCheck,
+  invokeGapAudit,
+  invokeSpecAudit,
+  specBatchEnabled,
+  specSystemPrompt,
+  stripJsonFences,
+  validateGapAuditResponse,
+  validateSpecAuditResponse,
+  anthropicBatchStatus,
+  anthropicSubmitBatch,
+  fetchBatchResults,
+  type GapAuditResponse,
+} from "./client.js";
+import { buildGapPayload, buildSpecPayload } from "./assemble.js";
+import {
+  buildJobParams,
+  enqueueJob,
+  listJobs,
+  pollSubmittedJobs,
+  submitPendingJobs,
+  type BatchClient,
+} from "./batch.js";
 import { TriggerPolicy, type AuditAction } from "./trigger.js";
 import { buildCoverSteerBody, buildGapSteerBody, buildSpecSteerBody } from "./steer.js";
 import { AuditGapConfigError } from "./types.js";
@@ -89,6 +112,10 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
   let gapSteers = 0;
   let lastError: LastError | null = null;
   let inFlight = 0;
+  // Batch monitor cadence.
+  let lastBatchPollTurn = 0;
+  let lastBatchPollMs = 0;
+  let batchPollInFlight = false;
 
   function renderStatus(): string {
     return (
@@ -131,34 +158,108 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
   }
 
   // -------------------------------------------------------------------------
+  // Result handlers — shared by the direct lane and the batch queue.
+  // -------------------------------------------------------------------------
+
+  function handleSpecAuditResult(ctx: PiContext, goalId: string, objective: string, res: SpecAuditResponse): void {
+    const checklist = createDod(
+      ctx.cwd,
+      goalId,
+      objective,
+      res.checklist.map((c) => ({
+        id: c.id,
+        requirement: c.requirement,
+        acceptanceCriteria: c.acceptance_criteria,
+      })),
+      process.env.AUDITGAP_SPEC_MODEL ?? process.env.VERIFIER_MODEL ?? "unknown",
+    );
+    notify(
+      ctx,
+      "Spec checklist for " + goalId + ": " + checklist.items.length + " item(s)" +
+        (res.risks.length > 0 ? " | risks: " + res.risks.length : ""),
+      "info",
+    );
+    sendSteer(ctx, buildSpecSteerBody(checklist, dodPath(ctx.cwd, goalId)));
+  }
+
+  function handleGapAuditResult(ctx: PiContext, goalId: string, gap: GapAuditResponse): void {
+    for (const v of gap.itemVerdicts) {
+      if (v.verdict === "pass") {
+        updateItem(ctx.cwd, goalId, v.id, "verified", v.reason);
+      } else if (v.verdict === "fail") {
+        updateItem(ctx.cwd, goalId, v.id, "failed", v.reason);
+      }
+    }
+    const fresh = loadDod(ctx.cwd, goalId);
+    if (!fresh) return;
+    const stillOpen = pendingItems(fresh).length + failedItems(fresh).length;
+    notify(
+      ctx,
+      "Gap audit for " + goalId + ": " + stillOpen + " open item(s)" +
+        (gap.missingRequirements.length > 0 ? " | " + gap.missingRequirements.length + " missing requirement area(s)" : "") +
+        " — " + gap.summary,
+      "info",
+    );
+    if (stillOpen > 0 || gap.missingRequirements.length > 0) {
+      sendSteer(ctx, buildGapSteerBody(fresh, gap.missingRequirements, gap.summary, dodPath(ctx.cwd, goalId)));
+      gapSteers++;
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Action executors (fire-and-forget)
   // -------------------------------------------------------------------------
 
-  function runSpecAudit(ctx: PiContext, goalId: string, objective: string): void {
+  /** Spec credentials needed to build Anthropic batch request params. */
+  function specRequestConfig(): { model: string; maxTokens: number } {
+    return {
+      model: process.env.AUDITGAP_SPEC_MODEL ?? process.env.VERIFIER_MODEL ?? "claude-opus-5.5",
+      maxTokens: Number(process.env.AUDITGAP_SPEC_MAX_TOKENS ?? "8192"),
+    };
+  }
+
+  /**
+   * Batch-mode enqueue for spec-lane actions. Returns false when batch
+   * mode is off (caller falls back to the direct lane).
+   */
+  function tryEnqueueBatchJob(ctx: PiContext, kind: "spec-audit" | "gap-audit", goalId: string, objective: string): boolean {
+    if (!specBatchEnabled()) return false;
+    try {
+      const params =
+        kind === "spec-audit"
+          ? buildJobParams({
+              ...specRequestConfig(),
+              systemPrompt: specSystemPrompt(),
+              userContent: buildSpecPayload({ objective, cwd: ctx.cwd }),
+            })
+          : buildJobParams({
+              ...specRequestConfig(),
+              systemPrompt: gapSystemPrompt(),
+              userContent: buildGapPayload({ checklist: loadDod(ctx.cwd, goalId)!, cwd: ctx.cwd }),
+            });
+      if (kind === "gap-audit" && !loadDod(ctx.cwd, goalId)) {
+        // Gap audit needs a checklist; without one a spec job is the
+        // useful batch request (checklist steer doubles as gap list).
+        enqueueJob(ctx.cwd, "spec-audit", goalId, params, objective);
+      } else {
+        enqueueJob(ctx.cwd, kind, goalId, params, objective);
+      }
+      return true;
+    } catch (err) {
+      recordFailure(ctx, "spec", err);
+      return true; // batch mode is on — do not ALSO fire the direct lane
+    }
+  }
+
+  function runSpecAudit(ctx: PiContext, goalId: string, objective: string, opts?: { direct?: boolean }): void {
+    if (!opts?.direct && tryEnqueueBatchJob(ctx, "spec-audit", goalId, objective)) return;
     inFlight++;
     paint(ctx);
     void (async () => {
       try {
         const res = await invokeSpecAudit({ objective, cwd: ctx.cwd });
         specCalls++;
-        const checklist = createDod(
-          ctx.cwd,
-          goalId,
-          objective,
-          res.checklist.map((c) => ({
-            id: c.id,
-            requirement: c.requirement,
-            acceptanceCriteria: c.acceptance_criteria,
-          })),
-          process.env.AUDITGAP_SPEC_MODEL ?? process.env.VERIFIER_MODEL ?? "unknown",
-        );
-        notify(
-          ctx,
-          "Spec checklist for " + goalId + ": " + checklist.items.length + " item(s)" +
-            (res.risks.length > 0 ? " | risks: " + res.risks.length : ""),
-          "info",
-        );
-        sendSteer(ctx, buildSpecSteerBody(checklist, dodPath(ctx.cwd, goalId)));
+        handleSpecAuditResult(ctx, goalId, objective, res);
       } catch (err) {
         if (err instanceof AuditGapConfigError) {
           notify(ctx, "Spec lane not configured — " + err.message, "warning");
@@ -172,55 +273,26 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
     })();
   }
 
-  function runGapAudit(ctx: PiContext, goalId: string): void {
+  function runGapAudit(ctx: PiContext, goalId: string, opts?: { direct?: boolean }): void {
     const objective = knownGoals.get(goalId) ?? "";
     const existing = loadDod(ctx.cwd, goalId);
+    if (!opts?.direct && tryEnqueueBatchJob(ctx, "gap-audit", goalId, objective)) return;
     inFlight++;
     paint(ctx);
     void (async () => {
       try {
-        let checklist: DodChecklist;
         if (!existing) {
           // No checklist yet (spec audit lost or failed) — generate one
           // now and steer from it; better late than never.
           const res = await invokeSpecAudit({ objective, cwd: ctx.cwd });
           specCalls++;
-          checklist = createDod(
-            ctx.cwd,
-            goalId,
-            objective,
-            res.checklist.map((c) => ({
-              id: c.id,
-              requirement: c.requirement,
-              acceptanceCriteria: c.acceptance_criteria,
-            })),
-            process.env.AUDITGAP_SPEC_MODEL ?? process.env.VERIFIER_MODEL ?? "unknown",
-          );
-        } else {
-          checklist = existing;
+          handleSpecAuditResult(ctx, goalId, objective, res);
         }
+        const checklist = loadDod(ctx.cwd, goalId);
+        if (!checklist) return;
         const gap: GapAuditResponse = await invokeGapAudit({ checklist, cwd: ctx.cwd });
         specCalls++;
-        for (const v of gap.itemVerdicts) {
-          if (v.verdict === "pass") {
-            updateItem(ctx.cwd, goalId, v.id, "verified", v.reason);
-          } else if (v.verdict === "fail") {
-            updateItem(ctx.cwd, goalId, v.id, "failed", v.reason);
-          }
-        }
-        const fresh = loadDod(ctx.cwd, goalId) ?? checklist;
-        const stillOpen = pendingItems(fresh).length + failedItems(fresh).length;
-        notify(
-          ctx,
-          "Gap audit for " + goalId + ": " + stillOpen + " open item(s)" +
-            (gap.missingRequirements.length > 0 ? " | " + gap.missingRequirements.length + " missing requirement area(s)" : "") +
-            " — " + gap.summary,
-          "info",
-        );
-        if (stillOpen > 0 || gap.missingRequirements.length > 0) {
-          sendSteer(ctx, buildGapSteerBody(fresh, gap.missingRequirements, gap.summary, dodPath(ctx.cwd, goalId)));
-          gapSteers++;
-        }
+        handleGapAuditResult(ctx, goalId, gap);
       } catch (err) {
         if (err instanceof AuditGapConfigError) {
           notify(ctx, "Spec lane not configured — " + err.message, "warning");
@@ -286,6 +358,74 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
   }
 
   // -------------------------------------------------------------------------
+  // Anthropic batch monitor: submit pending jobs, poll submitted ones,
+  // route completed results into the shared handlers.
+  // -------------------------------------------------------------------------
+
+  const batchClient: BatchClient = {
+    submit: (entries) => anthropicSubmitBatch(entries),
+    status: (batchId) => anthropicBatchStatus(batchId),
+    results: (url) => fetchBatchResults(url),
+  };
+
+  const BATCH_POLL_EVERY_TURNS = () => Number(process.env.AUDITGAP_BATCH_POLL_EVERY_TURNS ?? "5");
+  const BATCH_POLL_MIN_SECS = () => Number(process.env.AUDITGAP_BATCH_POLL_MIN_SECS ?? "60");
+
+  function maintainBatchQueue(ctx: PiContext): void {
+    if (!specBatchEnabled() || batchPollInFlight) return;
+    const now = Date.now();
+    if (
+      turnCounter - lastBatchPollTurn < BATCH_POLL_EVERY_TURNS() &&
+      now - lastBatchPollMs < BATCH_POLL_MIN_SECS() * 1000
+    ) {
+      return;
+    }
+    lastBatchPollTurn = turnCounter;
+    lastBatchPollMs = now;
+    batchPollInFlight = true;
+    void (async () => {
+      try {
+        // 1. Submit everything pending as ONE Anthropic batch.
+        const submitted = await submitPendingJobs(ctx.cwd, batchClient);
+        if (submitted > 0) {
+          notify(ctx, "Anthropic batch submitted: " + submitted + " audit request(s)", "info");
+        }
+        // 2. Poll submitted batches; route completions.
+        const resolved = await pollSubmittedJobs(ctx.cwd, batchClient);
+        for (const { job, outcome } of resolved) {
+          if (!outcome) continue; // still processing (or transient poll error)
+          specCalls++;
+          if (!outcome.ok || outcome.text === undefined) {
+            recordFailure(ctx, job.kind === "spec-audit" ? "spec" : "gap", new Error(outcome.error ?? "empty batch result"));
+            continue;
+          }
+          try {
+            const parsed = JSON.parse(stripJsonFences(outcome.text)) as unknown;
+            if (job.kind === "spec-audit") {
+              const res = validateSpecAuditResponse(parsed);
+              handleSpecAuditResult(ctx, job.goalId, job.objective ?? knownGoals.get(job.goalId) ?? "", res);
+            } else {
+              const gap = validateGapAuditResponse(parsed);
+              handleGapAuditResult(ctx, job.goalId, gap);
+            }
+          } catch (err) {
+            recordFailure(ctx, job.kind === "spec-audit" ? "spec" : "gap", err);
+          }
+        }
+      } catch (err) {
+        if (err instanceof AuditGapConfigError) {
+          notify(ctx, "Spec lane not configured — " + err.message, "warning");
+        } else {
+          recordFailure(ctx, "spec", err);
+        }
+      } finally {
+        batchPollInFlight = false;
+        paint(ctx);
+      }
+    })();
+  }
+
+  // -------------------------------------------------------------------------
   // turn_end hook: poll ledger -> backfill -> evaluate -> dispatch
   // -------------------------------------------------------------------------
 
@@ -328,6 +468,13 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
     } catch (err) {
       recordFailure(c, "spec", err);
     }
+
+    // Batch monitor: submit newly enqueued jobs, poll in-flight batches.
+    try {
+      maintainBatchQueue(c);
+    } catch {
+      // Best-effort; cadence will retry next turn.
+    }
     paint(c);
   });
 
@@ -349,7 +496,8 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
           notify(c, "Usage: /auditgap spec <goalId> (known: " + Array.from(knownGoals.keys()).join(", ") + ")", "warn");
           return;
         }
-        runSpecAudit(c, focusedGoalId, knownGoals.get(focusedGoalId)!);
+        // Manual triggers always use the direct lane — a human is waiting.
+        runSpecAudit(c, focusedGoalId, knownGoals.get(focusedGoalId)!, { direct: true });
         notify(c, "Spec audit requested for " + focusedGoalId, "info");
         return;
       }
@@ -359,7 +507,9 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
           notify(c, "Usage: /auditgap audit <goalId> (known: " + Array.from(knownGoals.keys()).join(", ") + ")", "warn");
           return;
         }
-        runGapAudit(c, focusedGoalId);
+        // Direct lane: gap audits at completion time are latency-critical
+        // (must land before pi-goal-x archives the goal).
+        runGapAudit(c, focusedGoalId, { direct: true });
         notify(c, "Gap audit requested for " + focusedGoalId, "info");
         return;
       }
@@ -385,11 +535,17 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
       }
 
       // Default: status
+      const pendingJobs = listJobs(c.cwd, "pending-submit").length;
+      const submittedJobs = listJobs(c.cwd, "submitted").length;
       const lines = [
         renderStatus(),
         "Ledger offset: " + poller.currentOffset(),
         "Spec lane: " + (process.env.AUDITGAP_SPEC_MODEL ?? process.env.VERIFIER_MODEL ?? "<unset>") +
-          " | Cover lane: " + (process.env.AUDITGAP_COVER_MODEL ?? "<unset>"),
+          " (" + (process.env.AUDITGAP_SPEC_API ?? "openai") +
+          (specBatchEnabled() ? ", batch" : "") + ")" +
+          " | Cover lane: " + (process.env.AUDITGAP_COVER_MODEL ?? "<unset>") + " (openai-compatible)",
+        "Batch queue: " + pendingJobs + " pending-submit, " + submittedJobs + " submitted" +
+          " | poll every " + (process.env.AUDITGAP_BATCH_POLL_EVERY_TURNS ?? "5") + " turn(s)",
         "Interval: " + (process.env.AUDITGAP_TURN_INTERVAL ?? "30") +
           " | CoverMax: " + (process.env.AUDITGAP_COVER_MAX_CALLS ?? "5") +
           " | PlateauSweeps: " + (process.env.AUDITGAP_PLATEAU_SWEEPS ?? "2"),

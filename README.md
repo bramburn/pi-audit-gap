@@ -14,9 +14,11 @@ pi-goal-x owns goal *state*; this extension owns *audit and intervention*. The i
 turn_end ──▶ poll goal_events.jsonl (byte-offset diff, O(new events))
           ──▶ backfill missed goal_created from .pi/goals/active_goal_*.md
           ──▶ TriggerPolicy.evaluate()
-                ├─ goal_created            ──▶ SPEC audit (Opus lane) ──▶ dod.json
-                ├─ completion_requested    ──▶ GAP audit (Opus lane) ──▶ [STEER:OPUS] before archival
-                └─ every N turns + plateau ──▶ COVER checks (DeepSeek lane, budget-bounded)
+          │     ├─ goal_created            ──▶ SPEC audit (Opus lane) ──▶ dod.json
+          │     ├─ completion_requested    ──▶ GAP audit (Opus lane) ──▶ [STEER:OPUS] before archival
+          │     └─ every N turns + plateau ──▶ COVER checks (DeepSeek lane, budget-bounded)
+          ──▶ batch monitor (when AUDITGAP_SPEC_BATCH=1): submit queued audits as ONE
+          │    Anthropic Messages Batch, poll status every few turns, route completions
           ──▶ fire-and-forget lane calls; failures notify, never crash
 ```
 
@@ -31,14 +33,34 @@ Copy `.env.example` and set the lane credentials (or export in your shell / pi l
 
 | Variable | Lane | Required | Notes |
 |----------|------|----------|-------|
-| `AUDITGAP_SPEC_BASE_URL` / `AUDITGAP_SPEC_API_KEY` / `AUDITGAP_SPEC_MODEL` | spec (Opus) | yes* | *falls back to pi-harvest's `VERIFIER_*` |
-| `AUDITGAP_COVER_BASE_URL` / `AUDITGAP_COVER_API_KEY` / `AUDITGAP_COVER_MODEL` | cover (DeepSeek) | yes | cheap, high-volume verifier |
+| `AUDITGAP_SPEC_API` | spec | no | `anthropic` (native, **required for batch**) or `openai` (OpenRouter/LiteLLM/proxies). Default `openai` |
+| `AUDITGAP_SPEC_BATCH` | spec | no | `1` = route spec work through the Anthropic Messages Batches API (50% off, minutes-to-hours latency) |
+| `AUDITGAP_SPEC_BASE_URL` / `AUDITGAP_SPEC_API_KEY` / `AUDITGAP_SPEC_MODEL` | spec | yes* | *falls back to pi-harvest's `VERIFIER_*`. For Anthropic: `https://api.anthropic.com/v1` + `sk-ant-...` |
+| `AUDITGAP_SPEC_MAX_TOKENS` | spec | no | default `8192` (Anthropic requires `max_tokens`) |
+| `AUDITGAP_COVER_BASE_URL` / `AUDITGAP_COVER_API_KEY` / `AUDITGAP_COVER_MODEL` | cover | yes | **always OpenAI-compatible**. DeepSeek direct (`https://api.deepseek.com/v1`) or OpenRouter (`https://openrouter.ai/api/v1` + any model id, e.g. `deepseek/deepseek-chat`) |
 | `AUDITGAP_SPEC_PROVIDER` / `AUDITGAP_COVER_PROVIDER` | steer tag | no | default `OPUS` / `DS` → `[STEER:OPUS]`, `[STEER:DS]` |
+| `AUDITGAP_BATCH_POLL_EVERY_TURNS` / `AUDITGAP_BATCH_POLL_MIN_SECS` | batch | no | defaults `5` turns / `60` s between batch status polls |
 | `AUDITGAP_TURN_INTERVAL` | trigger | no | default `30` turns between coverage sweeps |
 | `AUDITGAP_COVER_MAX_CALLS` | budget | no | default `5` cover calls per sweep |
 | `AUDITGAP_PLATEAU_SWEEPS` | trigger | no | default `2` stuck sweeps before spec-lane escalation |
 | `AUDITGAP_SPEC_TIMEOUT_MS` / `AUDITGAP_COVER_TIMEOUT_MS` | http | no | defaults `600000` / `120000` |
 | `AUDITGAP_MAX_RETRIES` | http | no | default `2`, backoff 1 s → 2 s on 429/5xx/timeout |
+
+### Anthropic batch mode
+
+With `AUDITGAP_SPEC_API=anthropic` + `AUDITGAP_SPEC_BATCH=1`, spec-lane audits are spooled durably to `.pi/audit-gap/queue/<job>.json`, grouped into **one** `POST /v1/messages/batches` submission, and polled (`GET /v1/messages/batches/{id}` → signed results URL) every few turns. Completed results feed the same handlers as direct calls — `dod.json` updates and `[STEER:OPUS]` injection happen whenever the batch lands. Terminal jobs archive to `queue/done/`. Manual `/auditgap spec|audit` always uses the direct lane because a human is waiting, and gap audits at `completion_requested` stay latency-critical — batch steers there can arrive after pi-goal-x has archived the goal.
+
+## Relationship to pi-harvest (no duplication)
+
+| | pi-harvest | pi-audit-gap cover lane |
+|---|---|---|
+| Supervises | **execution** — compile-failure loops | **coverage** — DoD checklist adherence |
+| Trigger | compiler signature streak ≥ 3, thrashing | turn-interval sweep, plateau |
+| Payload | Neat Slice of the failing conversation | goal + one checklist item + repo inventory |
+| Output | DPO/SFT training pairs + splice/rewind | dod.json status + occasional steer |
+| Steer tag | `[STEER:K3]` | `[STEER:DS]` |
+
+They share only the steer-injection mechanism and (optionally) env credentials — disjoint triggers, payloads, and artifacts.
 
 ## Slash commands
 
@@ -68,7 +90,7 @@ Requires [`pi-goal-x`](https://github.com/bramburn/pi-goal-x) to be installed �
 
 ```bash
 npm install
-npm test   # 36 unit tests across ledger/dod/trigger/steer+assemble
+npm test   # 46 unit tests across ledger/dod/trigger/steer/batch
 npm run build  # tsc → dist/
 ```
 
