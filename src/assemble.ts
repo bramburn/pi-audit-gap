@@ -55,6 +55,7 @@ export function buildRepoInventory(cwd: string): string[] {
       encoding: "utf8",
       timeout: 5000,
       windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
       maxBuffer: 8 * 1024 * 1024,
     });
     return raw
@@ -101,6 +102,7 @@ export function recentCommits(cwd: string, max: number = MAX_COMMITS): string[] 
       encoding: "utf8",
       timeout: 5000,
       windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
       maxBuffer: 1024 * 1024,
     });
     return raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
@@ -116,6 +118,7 @@ export function gitDiffSummary(cwd: string): string | null {
       encoding: "utf8",
       timeout: 5000,
       windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
       maxBuffer: 1024 * 1024,
     });
     return raw.trim().length > 0 ? raw : null;
