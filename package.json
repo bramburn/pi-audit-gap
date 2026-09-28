@@ -1,0 +1,35 @@
+{
+  "name": "pi-audit-gap",
+  "version": "0.1.0",
+  "description": "Goal-coverage supervision extension for pi.dev — reads pi-goal-x's goal ledger, generates Definition-of-Done checklists with a sparse high-level auditor (Opus lane), verifies coverage with a cheap model (DeepSeek lane), and injects [STEER:*] Tier-3 gaps before goal archival.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "test": "npm run build && node --experimental-strip-types --no-warnings --test test/ledger.test.ts test/dod.test.ts test/trigger.test.ts test/steer.test.ts"
+  },
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "pi.dev",
+    "pi-goal-x",
+    "supervision",
+    "audit",
+    "agent-loop"
+  ],
+  "author": "bramburn",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^5.9.3"
+  }
+}
