@@ -7,12 +7,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
+  archiveDod,
+  archivedDodPath,
   createDod,
   dodPath,
+  doneDir,
   failedItems,
   hasFailures,
   loadDod,
   pendingItems,
+  pruneArchivedDods,
   safeIdPart,
   updateItem,
   verifiedCount,
@@ -95,6 +99,66 @@ test("loadDod returns null for missing or corrupt files", () => {
     fs.mkdirSync(path.dirname(dodPath(cwd, "bad")), { recursive: true });
     fs.writeFileSync(dodPath(cwd, "bad"), "{broken");
     assert.equal(loadDod(cwd, "bad"), null);
+  });
+});
+
+// --- archival + pruning -------------------------------------------------------
+
+test("archiveDod moves the checklist to done/ and clears the active dir", () => {
+  withTempDir((cwd) => {
+    createDod(cwd, "g1", "obj", [{ id: "a", requirement: "r", acceptanceCriteria: "x" }]);
+    updateItem(cwd, "g1", "a", "verified", "done");
+
+    assert.equal(archiveDod(cwd, "g1"), true);
+    assert.equal(fs.existsSync(dodPath(cwd, "g1")), false);
+    assert.equal(fs.existsSync(path.join(doneDir(cwd), "g1", "dod.json")), true);
+
+    const archived = JSON.parse(fs.readFileSync(archivedDodPath(cwd, "g1"), "utf8"));
+    assert.equal(archived.goalId, "g1");
+    assert.equal(archived.items[0].status, "verified");
+
+    // No active checklist left -> a re-created goal gets a fresh spec audit.
+    assert.equal(loadDod(cwd, "g1"), null);
+  });
+});
+
+test("archiveDod is a no-op for goals without a checklist", () => {
+  withTempDir((cwd) => {
+    assert.equal(archiveDod(cwd, "ghost"), false);
+    assert.equal(fs.existsSync(doneDir(cwd)), false);
+  });
+});
+
+test("pruneArchivedDods removes only entries past retention", () => {
+  withTempDir((cwd) => {
+    createDod(cwd, "old-goal", "obj", [{ id: "a", requirement: "r", acceptanceCriteria: "x" }]);
+    createDod(cwd, "new-goal", "obj", [{ id: "a", requirement: "r", acceptanceCriteria: "x" }]);
+    archiveDod(cwd, "old-goal");
+    archiveDod(cwd, "new-goal");
+
+    // Age the old one by rewriting updatedAt to 60 days ago.
+    const oldPath = archivedDodPath(cwd, "old-goal");
+    const old = JSON.parse(fs.readFileSync(oldPath, "utf8"));
+    old.updatedAt = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
+    fs.writeFileSync(oldPath, JSON.stringify(old, null, 2), "utf8");
+
+    const removed = pruneArchivedDods(cwd, 30);
+    assert.deepEqual(removed, ["old-goal"]);
+    assert.equal(fs.existsSync(archivedDodPath(cwd, "old-goal")), false);
+    assert.equal(fs.existsSync(archivedDodPath(cwd, "new-goal")), true);
+
+    // 0 disables pruning.
+    assert.deepEqual(pruneArchivedDods(cwd, 0), []);
+    assert.equal(fs.existsSync(archivedDodPath(cwd, "new-goal")), true);
+  });
+});
+
+test("pruneArchivedDods survives a corrupt archive entry", () => {
+  withTempDir((cwd) => {
+    createDod(cwd, "g1", "obj", [{ id: "a", requirement: "r", acceptanceCriteria: "x" }]);
+    archiveDod(cwd, "g1");
+    fs.writeFileSync(archivedDodPath(cwd, "g1"), "{broken", "utf8");
+    assert.deepEqual(pruneArchivedDods(cwd, 30), []);
   });
 });
 

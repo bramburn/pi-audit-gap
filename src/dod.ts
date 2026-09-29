@@ -8,11 +8,14 @@
  * supervision state, not chat).
  *
  * Writes are atomic (tmp + rename). Reads tolerate a missing/corrupt
- * file by returning null.
+ * file by returning null. On goal_completed / goal_aborted the checklist
+ * is archived to done/<goalId>/ and pruned after AUDITGAP_DONE_RETENTION_DAYS
+ * (default 30; 0 = keep forever).
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { atomicWriteJson } from "./fsutil.js";
 import type { DodChecklist, DodItem, DodItemStatus } from "./types.js";
 
 export const AUDIT_DIR_REL = path.join(".pi", "audit-gap");
@@ -34,11 +37,89 @@ export function dodPath(cwd: string, goalId: string): string {
   return path.join(goalDir(cwd, goalId), "dod.json");
 }
 
-function atomicWriteJson(filePath: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmp = filePath + "." + process.pid + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), "utf8");
-  fs.renameSync(tmp, filePath);
+/** Archive root: checklists of completed/aborted goals move here. */
+export function doneDir(cwd: string): string {
+  return path.join(auditDir(cwd), "done");
+}
+
+export function archivedDodPath(cwd: string, goalId: string): string {
+  return path.join(doneDir(cwd), safeIdPart(goalId), "dod.json");
+}
+
+/**
+ * How long archived checklists are kept, in days. Set
+ * AUDITGAP_DONE_RETENTION_DAYS=0 to keep archived checklists forever.
+ */
+export function doneRetentionDays(): number {
+  const raw = process.env.AUDITGAP_DONE_RETENTION_DAYS;
+  if (raw === undefined || raw === "") return 30;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return 30;
+  return n;
+}
+
+/**
+ * Move an active checklist into done/ after the goal completes or is
+ * aborted. Mirrors the batch queue's archiveJob pattern. Returns true when
+ * a checklist was archived. Best-effort: a stale copy left behind (e.g.
+ * unlink refused by a Windows file lock) is harmless — the active path is
+ * only read for tracked goals, and a re-created goal with the same id gets
+ * a fresh spec audit because its active dod.json is gone.
+ */
+export function archiveDod(cwd: string, goalId: string): boolean {
+  const src = dodPath(cwd, goalId);
+  let checklist: unknown;
+  try {
+    checklist = JSON.parse(fs.readFileSync(src, "utf8"));
+  } catch {
+    return false;
+  }
+  atomicWriteJson(archivedDodPath(cwd, goalId), checklist);
+  try {
+    fs.unlinkSync(src);
+  } catch {
+    // Locked by a concurrent reader — the archive copy is authoritative.
+  }
+  try {
+    fs.rmdirSync(goalDir(cwd, goalId));
+  } catch {
+    // Non-empty goal dir (stray files) — leave it for a human to inspect.
+  }
+  return true;
+}
+
+/**
+ * Delete archived checklists older than `maxAgeDays` (based on the
+ * checklist's updatedAt). Returns the goal ids removed. A maxAgeDays of 0
+ * disables pruning. Never throws — housekeeping must not crash the host.
+ */
+export function pruneArchivedDods(cwd: string, maxAgeDays: number = doneRetentionDays()): string[] {
+  if (maxAgeDays <= 0) return [];
+  const root = doneDir(cwd);
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(root);
+  } catch {
+    return [];
+  }
+  const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
+  const removed: string[] = [];
+  for (const name of entries) {
+    const entryDir = path.join(root, name);
+    const file = path.join(entryDir, "dod.json");
+    try {
+      if (!fs.statSync(file).isFile()) continue;
+      const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<DodChecklist>;
+      const updatedAt = typeof parsed.updatedAt === "string" ? Date.parse(parsed.updatedAt) : NaN;
+      const ageMs = Number.isFinite(updatedAt) ? Date.now() - updatedAt : Number.POSITIVE_INFINITY;
+      if (ageMs <= maxAgeMs) continue;
+      fs.rmSync(entryDir, { recursive: true, force: true });
+      removed.push(name);
+    } catch {
+      // Unreadable entry — leave it in place for a human to inspect.
+    }
+  }
+  return removed;
 }
 
 export function loadDod(cwd: string, goalId: string): DodChecklist | null {
