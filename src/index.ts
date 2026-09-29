@@ -14,6 +14,9 @@
  *   /auditgap spec [goalId]     — manual spec audit (Opus lane)
  *   /auditgap audit [goalId]    — manual gap audit (Opus lane)
  *   /auditgap dod [goalId]      — print the DoD checklist
+ *   /auditgap-settings          — pick spec/cover models from pi's catalogue
+ *                                 (searchable picker, stored in
+ *                                 .pi/audit-gap/settings.json)
  *
  * Design mirrors pi-harvest: minimal local runtime interfaces (builds
  * without pi's typings), fire-and-forget audits so the pi runtime is
@@ -23,11 +26,13 @@
 import { GoalLedgerPoller } from "./ledger.js";
 import { backfillCandidates } from "./backfill.js";
 import {
+  archiveDod,
   createDod,
   dodPath,
   failedItems,
   loadDod,
   pendingItems,
+  pruneArchivedDods,
   updateItem,
   verifiedCount,
 } from "./dod.js";
@@ -44,7 +49,10 @@ import {
   validateSpecAuditResponse,
   anthropicBatchStatus,
   anthropicSubmitBatch,
+  batchApi,
   fetchBatchResults,
+  openrouterBatchStatus,
+  openrouterSubmitBatch,
   type GapAuditResponse,
 } from "./client.js";
 import { buildGapPayload, buildSpecPayload } from "./assemble.js";
@@ -59,6 +67,14 @@ import {
 import { TriggerPolicy, type AuditAction } from "./trigger.js";
 import { buildCoverSteerBody, buildGapSteerBody, buildSpecSteerBody } from "./steer.js";
 import { AuditGapConfigError } from "./types.js";
+import {
+  applyLaneSelections,
+  loadSettings,
+  setLaneSelection,
+  type LaneApplyResult,
+  type ModelRegistryLike,
+} from "./settings.js";
+import { pickLaneModel, type PickerComponent, type PickerTheme } from "./model-picker.js";
 
 // ---------------------------------------------------------------------------
 // Minimal runtime interfaces (same pattern as pi-harvest)
@@ -67,12 +83,25 @@ import { AuditGapConfigError } from "./types.js";
 interface UiHelpers {
   setStatus?(key: string, content: unknown): void;
   notify?(message: string, level?: string): void;
+  select?(title: string, options: string[]): Promise<string | undefined>;
+  custom?<T>(
+    factory: (
+      tui: unknown,
+      theme: PickerTheme,
+      keybindings: unknown,
+      done: (result: T) => void,
+    ) => PickerComponent | Promise<PickerComponent>,
+    options?: unknown,
+  ): Promise<T>;
 }
 
 interface PiContext {
   ui: UiHelpers;
   cwd: string;
   model?: { id?: string; name?: string; provider?: string } | undefined;
+  modelRegistry?: unknown;
+  mode?: string;
+  hasUI?: boolean;
   sessionManager?: { getSessionId(): string };
   [key: string]: unknown;
 }
@@ -155,6 +184,123 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
     } catch (err) {
       notify(ctx, "sendUserMessage failed: " + ((err as Error)?.message ?? String(err)), "warn");
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // /auditgap-settings — lane model selection from pi's catalogue
+  // -------------------------------------------------------------------------
+
+  /**
+   * Apply stored selections to the AUDITGAP_* env vars. Called on
+   * session_start (verbose: report applied lanes) and after picker
+   * actions (the caller reports the specific lane itself).
+   */
+  async function applyStoredSelections(ctx: PiContext, verbose: boolean): Promise<LaneApplyResult[]> {
+    const results = await applyLaneSelections(ctx.cwd, ctx.modelRegistry as ModelRegistryLike | undefined);
+    if (verbose) {
+      for (const r of results) {
+        if (r.status === "applied") {
+          notify(ctx, r.lane + " lane model: " + r.detail + " (from /auditgap-settings)", "info");
+        } else if (r.status === "missing" || r.status === "failed") {
+          notify(ctx, r.lane + " lane selection not applied: " + r.detail, "warning");
+        }
+      }
+    }
+    return results;
+  }
+
+  function redact(value: string | undefined): string {
+    if (!value) return "<unset>";
+    if (value.length <= 10) return "••••••••";
+    return value.slice(0, 7) + "…";
+  }
+
+  async function selectLaneModel(ctx: PiContext, lane: "spec" | "cover"): Promise<void> {
+    const choice = await pickLaneModel(
+      { mode: ctx.mode ?? "tui", ui: ctx.ui as never },
+      ctx.modelRegistry as never,
+      lane,
+    );
+    if (!choice) {
+      notify(ctx, "No model picked — " + lane + " lane unchanged", "info");
+      return;
+    }
+    setLaneSelection(ctx.cwd, lane, choice);
+    const results = await applyStoredSelections(ctx, false);
+    const mine = results.find((r) => r.lane === lane);
+    if (mine?.status === "applied") {
+      notify(
+        ctx,
+        (lane === "spec" ? "Spec" : "Cover") + " lane → " + choice.provider + "/" + choice.modelId +
+          " (stored in .pi/audit-gap/settings.json)",
+        "info",
+      );
+    } else {
+      notify(
+        ctx,
+        "Stored " + choice.provider + "/" + choice.modelId + " but could not apply it: " + (mine?.detail ?? "unknown") +
+          " — check /login or models.json for this provider",
+        "warning",
+      );
+    }
+  }
+
+  async function clearLaneSelection(ctx: PiContext, lane: "spec" | "cover" | undefined): Promise<void> {
+    const lanes: Array<"spec" | "cover"> = lane ? [lane] : ["spec", "cover"];
+    for (const l of lanes) {
+      setLaneSelection(ctx.cwd, l, undefined);
+    }
+    await applyStoredSelections(ctx, false);
+    notify(
+      ctx,
+      "Cleared " + (lane ?? "both lanes") + " model selection — env config back in effect",
+      "info",
+    );
+  }
+
+  function showSettingsStatus(ctx: PiContext): void {
+    const stored = loadSettings(ctx.cwd);
+    const lines: string[] = ["AuditGap lane model settings (.pi/audit-gap/settings.json):"];
+    for (const lane of ["spec", "cover"] as const) {
+      const sel = stored?.[lane];
+      const prefix = lane === "spec" ? "AUDITGAP_SPEC" : "AUDITGAP_COVER";
+      lines.push(
+        " " + lane + ": " +
+          (sel ? sel.provider + "/" + sel.modelId + " (stored)" : "no stored selection") +
+          " | effective: " +
+          (process.env[prefix + "_MODEL"] ?? "<unset>") + " @ " +
+          (process.env[prefix + "_BASE_URL"] ?? "<unset>") +
+          " key:" + redact(process.env[prefix + "_API_KEY"]),
+      );
+    }
+    lines.push(
+      "Spec transport: " + (process.env.AUDITGAP_SPEC_API ?? "openai") +
+        (specBatchEnabled() ? " (batch on)" : "") +
+        " | change with: /auditgap-settings → Select spec/cover model",
+    );
+    ctx.ui?.notify?.(lines.join("\n"), "info");
+  }
+
+  async function settingsMenu(ctx: PiContext): Promise<void> {
+    if (!ctx.hasUI || typeof ctx.ui?.select !== "function") {
+      notify(ctx, "Usage: /auditgap-settings spec | cover | status | clear [spec|cover]", "warn");
+      return;
+    }
+    const choice = await ctx.ui.select(
+      "AuditGap settings",
+      [
+        "Select spec model (Opus lane)",
+        "Select cover model (cheap lane)",
+        "Show current settings",
+        "Clear spec model selection",
+        "Clear cover model selection",
+      ],
+    );
+    if (choice === "Select spec model (Opus lane)") await selectLaneModel(ctx, "spec");
+    else if (choice === "Select cover model (cheap lane)") await selectLaneModel(ctx, "cover");
+    else if (choice === "Show current settings") showSettingsStatus(ctx);
+    else if (choice === "Clear spec model selection") await clearLaneSelection(ctx, "spec");
+    else if (choice === "Clear cover model selection") await clearLaneSelection(ctx, "cover");
   }
 
   // -------------------------------------------------------------------------
@@ -362,9 +508,13 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
   // route completed results into the shared handlers.
   // -------------------------------------------------------------------------
 
+  // Dispatch on the batch API at call time so /auditgap-settings picks
+  // (which rewrite the spec base URL/model) take effect without a reload.
   const batchClient: BatchClient = {
-    submit: (entries) => anthropicSubmitBatch(entries),
-    status: (batchId) => anthropicBatchStatus(batchId),
+    submit: (entries) => (batchApi() === "openrouter" ? openrouterSubmitBatch(entries) : anthropicSubmitBatch(entries)),
+    status: (batchId) => (batchApi() === "openrouter" ? openrouterBatchStatus(batchId) : anthropicBatchStatus(batchId)),
+    // Only the Anthropic transport fetches results from a signed URL;
+    // OpenRouter returns them inline in the poll response.
     results: (url) => fetchBatchResults(url),
   };
 
@@ -388,7 +538,7 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
         // 1. Submit everything pending as ONE Anthropic batch.
         const submitted = await submitPendingJobs(ctx.cwd, batchClient);
         if (submitted > 0) {
-          notify(ctx, "Anthropic batch submitted: " + submitted + " audit request(s)", "info");
+          notify(ctx, batchApi() + " batch submitted: " + submitted + " audit request(s)", "info");
         }
         // 2. Poll submitted batches; route completions.
         const resolved = await pollSubmittedJobs(ctx.cwd, batchClient);
@@ -469,6 +619,23 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
       recordFailure(c, "spec", err);
     }
 
+    // Archival: completed/aborted goals move their checklist to done/ so
+    // the active audit root only holds live goals; archived checklists
+    // past retention are pruned. Runs after all dispatches so in-flight
+    // gap-audit writes for the goal have landed. Best-effort housekeeping.
+    for (const event of result.events) {
+      if (event.type !== "goal_completed" && event.type !== "goal_aborted") continue;
+      try {
+        archiveDod(c.cwd, event.goalId);
+        const pruned = pruneArchivedDods(c.cwd);
+        if (pruned.length > 0) {
+          notify(c, "Pruned " + pruned.length + " archived checklist(s) past retention", "info");
+        }
+      } catch {
+        // Never crash the host over housekeeping.
+      }
+    }
+
     // Batch monitor: submit newly enqueued jobs, poll in-flight batches.
     try {
       maintainBatchQueue(c);
@@ -482,8 +649,38 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
   // Slash commands
   // -------------------------------------------------------------------------
 
+  pi.registerCommand("auditgap-settings", {
+    description: "Lane model selection. Subcommands: spec | cover | status | clear [spec|cover]",
+    handler: async (args, ctx) => {
+      const c = ctx as PiContext;
+      try {
+        const [sub, sub2] = (args ?? "").trim().split(/\s+/).filter(Boolean);
+        if (sub === "spec" || sub === "cover") {
+          await selectLaneModel(c, sub);
+        } else if (sub === "status") {
+          showSettingsStatus(c);
+        } else if (sub === "clear") {
+          await clearLaneSelection(c, sub2 === "spec" || sub2 === "cover" ? sub2 : undefined);
+        } else {
+          await settingsMenu(c);
+        }
+      } catch (err) {
+        notify(c, "settings error: " + ((err as Error)?.message ?? String(err)), "warn");
+      }
+    },
+  });
+
+  // Apply stored model selections on every session start so restarts and
+  // /reload pick them up without touching env vars by hand.
+  pi.on("session_start", (_event, ctx) => {
+    const c = ctx as PiContext;
+    applyStoredSelections(c, true).catch((err: unknown) => {
+      notify(c, "settings apply failed: " + ((err as Error)?.message ?? String(err)), "warn");
+    });
+  });
+
   pi.registerCommand("auditgap", {
-    description: "pi-audit-gap controls. Subcommands: status | spec [goalId] | audit [goalId] | dod [goalId]",
+    description: "pi-audit-gap controls. Subcommands: status | spec [goalId] | audit [goalId] | dod [goalId] | models: /auditgap-settings",
     handler: async (args, ctx) => {
       const c = ctx as PiContext;
       const rawArgs = (args ?? "").trim();
@@ -542,7 +739,7 @@ export default function auditGapExtension(pi: ExtensionAPI): void {
         "Ledger offset: " + poller.currentOffset(),
         "Spec lane: " + (process.env.AUDITGAP_SPEC_MODEL ?? process.env.VERIFIER_MODEL ?? "<unset>") +
           " (" + (process.env.AUDITGAP_SPEC_API ?? "openai") +
-          (specBatchEnabled() ? ", batch" : "") + ")" +
+          (specBatchEnabled() ? ", batch:" + batchApi() : "") + ")" +
           " | Cover lane: " + (process.env.AUDITGAP_COVER_MODEL ?? "<unset>") + " (openai-compatible)",
         "Batch queue: " + pendingJobs + " pending-submit, " + submittedJobs + " submitted" +
           " | poll every " + (process.env.AUDITGAP_BATCH_POLL_EVERY_TURNS ?? "5") + " turn(s)",

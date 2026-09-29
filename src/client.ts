@@ -14,8 +14,8 @@
  *     Works with OpenRouter, DeepSeek, LiteLLM, pi-harvest's verifier,
  *     etc. Uses response_format json_object.
  *   - "anthropic": native Anthropic POST {base}/messages (beta). Required
- *     for the Messages Batches API (50% discount) — batch mode
- *     (AUDITGAP_SPEC_BATCH=1) is only supported on this transport.
+ *     for the native Messages Batches API — one of two batch submission
+ *     transports (see batchApi() below).
  *
  * - COVER lane (cheap, volume): per-item pass/fail verification of DoD
  *   checklist entries during periodic sweeps. Always OpenAI-compatible
@@ -54,9 +54,30 @@ export function specTransport(): Transport {
   return raw === "anthropic" ? "anthropic" : "openai";
 }
 
-/** True when spec-lane work should go through the Anthropic batch queue. */
+/** True when spec-lane work should go through the batch queue. */
 export function specBatchEnabled(): boolean {
-  return specTransport() === "anthropic" && (process.env.AUDITGAP_SPEC_BATCH ?? "").trim() === "1";
+  if ((process.env.AUDITGAP_SPEC_BATCH ?? "").trim() !== "1") return false;
+  if (specTransport() === "anthropic") return true;
+  // OpenAI-compatible direct lane — the batch queue can still submit via
+  // OpenRouter's Batch API when the spec base URL is OpenRouter.
+  return batchApi() === "openrouter";
+}
+
+/** Which batch submission API the spec queue talks to. */
+export type BatchApi = "anthropic" | "openrouter";
+
+/**
+ * Select the batch API. AUDITGAP_SPEC_BATCH_API is explicit
+ * ("openrouter" | "anthropic"); when unset it is derived from the spec
+ * base URL so a /auditgap-settings pick of an OpenRouter model batches
+ * through OpenRouter without any extra configuration.
+ */
+export function batchApi(): BatchApi {
+  const raw = (process.env.AUDITGAP_SPEC_BATCH_API ?? "").trim().toLowerCase();
+  if (raw === "openrouter") return "openrouter";
+  if (raw === "anthropic") return "anthropic";
+  const base = (process.env.AUDITGAP_SPEC_BASE_URL ?? process.env.VERIFIER_BASE_URL ?? "").toLowerCase();
+  return base.includes("openrouter.ai") ? "openrouter" : "anthropic";
 }
 
 function readLaneConfig(lane: Lane): LaneConfig {
@@ -471,6 +492,10 @@ export interface BatchStatusResult {
   status: BatchStatus;
   resultsUrl?: string;
   requestCounts?: { processing: number; succeeded: number; errored: number; canceled: number; expired: number };
+  /** OpenRouter returns per-request results inline in the poll response. */
+  outcomes?: Map<string, BatchEntryOutcome>;
+  /** Terminal batch-level error (OpenRouter failed/expired/cancelled). */
+  error?: string;
 }
 
 /** GET /v1/messages/batches/{id} — poll processing state. */
@@ -578,6 +603,193 @@ export async function fetchBatchResults(resultsUrl: string): Promise<Map<string,
     throw new Error("batch results HTTP " + res.status + ": " + text.slice(0, 500));
   }
   return parseBatchResults(await res.text());
+}
+
+// ---------------------------------------------------------------------------
+// OpenRouter Batch API
+// ---------------------------------------------------------------------------
+//
+// A different shape from Anthropic's native Messages Batches API:
+//
+//   POST {base}/batches     { endpoint, model, requests: [{custom_id, body}] }
+//   GET  {base}/batches/{id}   202 Accepted -> poll; results come back INLINE
+//
+// Request bodies use the chat-completions shape (endpoint
+// "/v1/chat/completions") — the same api pi's OpenRouter catalogue reports
+// for these models. The durable queue still stores Anthropic-shaped job
+// params (shared with the native transport), so submission converts
+// params -> chat body here.
+//
+// Batch runs on a model's ":batch" endpoint variant. The plain catalogue
+// id usually resolves on its own, so submission tries it first and retries
+// with the ":batch" suffix only when OpenRouter rejects the request.
+
+/** Convert Anthropic-shaped job params into an OpenAI chat-completions body. */
+export function openRouterBodyFromParams(params: Record<string, unknown>): Record<string, unknown> {
+  const messages: Array<Record<string, unknown>> = [];
+  if (typeof params.system === "string" && params.system) {
+    messages.push({ role: "system", content: params.system });
+  }
+  if (Array.isArray(params.messages)) {
+    for (const m of params.messages) {
+      if (m && typeof m === "object") messages.push(m as Record<string, unknown>);
+    }
+  }
+  const body: Record<string, unknown> = {
+    messages,
+    temperature: typeof params.temperature === "number" ? params.temperature : 0,
+    response_format: { type: "json_object" },
+  };
+  if (typeof params.max_tokens === "number") body.max_tokens = params.max_tokens;
+  return body;
+}
+
+/** Build the OpenRouter batch submission payload. */
+export function buildOpenRouterBatchPayload(entries: BatchRequestEntry[], model: string): Record<string, unknown> {
+  return {
+    endpoint: "/v1/chat/completions",
+    model,
+    requests: entries.map((e) => ({ custom_id: e.customId, body: openRouterBodyFromParams(e.params) })),
+  };
+}
+
+/** POST {base}/batches — submit all queued jobs as one OpenRouter batch. */
+export async function openrouterSubmitBatch(entries: BatchRequestEntry[]): Promise<BatchSubmissionResult> {
+  if (entries.length === 0) throw new Error("no batch entries to submit");
+  const cfg = readLaneConfig("spec");
+  const url = cfg.baseUrl.replace(/\/+$/, "") + "/batches";
+  const modelsToTry = cfg.model.trim().endsWith(":batch") ? [cfg.model] : [cfg.model, cfg.model + ":batch"];
+  for (const model of modelsToTry) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + cfg.apiKey },
+        body: JSON.stringify(buildOpenRouterBatchPayload(entries, model)),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      const e = err as Error;
+      if (e.name === "AbortError") throw new Error("batch submit timed out after " + cfg.timeoutMs + "ms");
+      throw new Error("batch submit network error: " + e.message);
+    }
+    clearTimeout(timer);
+    if (res.status === 202 || res.status === 200) {
+      const payload = (await res.json()) as { id?: string };
+      if (typeof payload.id !== "string" || payload.id.length === 0) {
+        throw new Error("batch submit response missing id");
+      }
+      return { batchId: payload.id };
+    }
+    const text = await res.text().catch(() => "");
+    // A model without a plain batch endpoint gets a 400 — retry once with
+    // the ":batch" variant before giving up.
+    if (res.status === 400 && model === modelsToTry[0] && modelsToTry.length > 1) continue;
+    throw new Error("batch submit HTTP " + res.status + ": " + text.slice(0, 500));
+  }
+  throw new Error("batch submit rejected for " + cfg.model + " and its :batch variant");
+}
+
+/** Extract text from a batch entry response (chat-completions or Messages shape). */
+function extractOpenRouterText(response: unknown): string | undefined {
+  if (!response || typeof response !== "object") return undefined;
+  const obj = response as Record<string, unknown>;
+  if (Array.isArray(obj.choices)) {
+    const first = obj.choices[0] as Record<string, unknown> | undefined;
+    const content = first?.message ? (first.message as Record<string, unknown>).content : undefined;
+    if (typeof content === "string" && content.length > 0) return content;
+  }
+  try {
+    return parseAnthropicText(response);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Parse OpenRouter inline batch results — an array of
+ * {custom_id, response|error} entries or a record keyed by custom_id.
+ * Exported pure — unit-tested against OpenRouter-shaped fixtures.
+ */
+export function parseOpenRouterResults(results: unknown): Map<string, BatchEntryOutcome> {
+  const out = new Map<string, BatchEntryOutcome>();
+  const entries: Array<[string, unknown]> = [];
+  if (Array.isArray(results)) {
+    for (const item of results) {
+      if (item && typeof item === "object" && typeof (item as Record<string, unknown>).custom_id === "string") {
+        entries.push([(item as Record<string, unknown>).custom_id as string, item]);
+      }
+    }
+  } else if (results && typeof results === "object") {
+    for (const [key, value] of Object.entries(results as Record<string, unknown>)) {
+      entries.push([key, value]);
+    }
+  }
+  for (const [customId, item] of entries) {
+    if (!item || typeof item !== "object") {
+      out.set(customId, { ok: false, error: "malformed result entry" });
+      continue;
+    }
+    const obj = item as Record<string, unknown>;
+    if (obj.error !== undefined && obj.error !== null) {
+      const msg = typeof obj.error === "string" ? obj.error : JSON.stringify(obj.error);
+      out.set(customId, { ok: false, error: (msg || "batch entry error").slice(0, 500) });
+      continue;
+    }
+    const text = extractOpenRouterText(obj.response);
+    if (text === undefined) {
+      out.set(customId, { ok: false, error: "batch entry missing response content" });
+      continue;
+    }
+    out.set(customId, { ok: true, text });
+  }
+  return out;
+}
+
+/** Parse an OpenRouter batch status payload. Exported pure for tests. */
+export function parseOpenRouterBatchStatus(payload: unknown): BatchStatusResult {
+  if (!payload || typeof payload !== "object") throw new Error("batch status response is not an object");
+  const obj = payload as Record<string, unknown>;
+  const raw = typeof obj.status === "string" ? obj.status : "";
+  if (raw === "completed") {
+    return { status: "ended", outcomes: parseOpenRouterResults(obj.results) };
+  }
+  if (raw === "failed" || raw === "expired" || raw === "cancelled" || raw === "canceled") {
+    const err = typeof obj.error === "string" && obj.error ? obj.error : "batch " + raw;
+    return { status: "ended", error: err };
+  }
+  // "validating" | "in_progress" | "processing" | unknown -> still running.
+  return { status: "in_progress" };
+}
+
+/** GET {base}/batches/{id} — poll processing state; results are inline. */
+export async function openrouterBatchStatus(batchId: string): Promise<BatchStatusResult> {
+  const cfg = readLaneConfig("spec");
+  const url = cfg.baseUrl.replace(/\/+$/, "") + "/batches/" + encodeURIComponent(batchId);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "GET",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + cfg.apiKey },
+      signal: controller.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    const e = err as Error;
+    if (e.name === "AbortError") throw new Error("batch status timed out after " + cfg.timeoutMs + "ms");
+    throw new Error("batch status network error: " + e.message);
+  }
+  clearTimeout(timer);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error("batch status HTTP " + res.status + ": " + text.slice(0, 500));
+  }
+  return parseOpenRouterBatchStatus(await res.json());
 }
 
 // ---------------------------------------------------------------------------

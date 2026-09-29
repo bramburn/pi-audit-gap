@@ -1,16 +1,18 @@
 /**
- * Anthropic Messages Batches queue — durable spool + monitor.
+ * Spec-lane batch queue — durable spool + monitor.
  *
- * Why: the spec lane (Opus) is expensive; Anthropic's Batches API gives
- * 50% off at minutes-to-hours latency. Audit requests are not
- * latency-sensitive by design (checklists steer the worker whenever they
- * land), so batch is the DEFAULT operating mode for the spec lane when
- * AUDITGAP_SPEC_API=anthropic and AUDITGAP_SPEC_BATCH=1.
+ * Why: the spec lane (Opus) is expensive; batch APIs give ~50% off at
+ * minutes-to-hours latency. Audit requests are not latency-sensitive by
+ * design (checklists steer the worker whenever they land), so batch is
+ * the DEFAULT operating mode for the spec lane when AUDITGAP_SPEC_BATCH=1.
+ * Two submission APIs are supported (see batchApi() in client.ts):
+ * Anthropic's native Messages Batches API (direct Anthropic base URLs)
+ * and OpenRouter's Batch API (OpenRouter base URLs, results inline).
  *
  * Lifecycle of a job (.pi/audit-gap/queue/<jobId>.json):
  *
  *   pending-submit ──(submitPendingJobs groups all pending into ONE
- *        │            Anthropic batch; stores batch_id on each job)
+ *        │            batch submission; stores batch_id on each job)
  *        ▼
  *   submitted ──(pollSubmittedJobs, every N turns / M seconds)
  *        │            ├─ in_progress → update lastStatus, stay queued
@@ -27,7 +29,8 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { buildAnthropicParams, type BatchEntryOutcome } from "./client.js";
+import { atomicWriteJson } from "./fsutil.js";
+import { buildAnthropicParams, type BatchEntryOutcome, type BatchStatusResult } from "./client.js";
 
 export const QUEUE_REL = path.join(".pi", "audit-gap", "queue");
 
@@ -48,10 +51,12 @@ export interface BatchJob {
   updatedAt: string;
 }
 
-/** Injected client surface (real one lives in client.ts). */
+/** Injected client surface (real implementations live in client.ts —
+ *  one set for the native Anthropic Messages Batches API, one for the
+ *  OpenRouter Batch API; index.ts dispatches on batchApi()). */
 export interface BatchClient {
   submit(entries: Array<{ customId: string; params: Record<string, unknown> }>): Promise<{ batchId: string }>;
-  status(batchId: string): Promise<{ status: "in_progress" | "canceling" | "ended"; resultsUrl?: string }>;
+  status(batchId: string): Promise<BatchStatusResult>;
   results(resultsUrl: string): Promise<Map<string, BatchEntryOutcome>>;
 }
 
@@ -61,13 +66,6 @@ export function queueDir(cwd: string): string {
 
 function jobPath(cwd: string, jobId: string): string {
   return path.join(queueDir(cwd), jobId + ".json");
-}
-
-function atomicWriteJson(filePath: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmp = filePath + "." + process.pid + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), "utf8");
-  fs.renameSync(tmp, filePath);
 }
 
 let counter = 0;
@@ -193,7 +191,7 @@ export async function pollSubmittedJobs(cwd: string, client: BatchClient): Promi
   if (submitted.length === 0) return [];
 
   // Resolve ended batches once (many jobs share one batchId).
-  const batchStatusCache = new Map<string, { status: "in_progress" | "canceling" | "ended"; resultsUrl?: string }>();
+  const batchStatusCache = new Map<string, BatchStatusResult>();
   const resultsCache = new Map<string, Map<string, BatchEntryOutcome>>();
   async function statusFor(batchId: string) {
     if (!batchStatusCache.has(batchId)) {
@@ -239,15 +237,20 @@ export async function pollSubmittedJobs(cwd: string, client: BatchClient): Promi
         continue;
       }
       // ended
-      if (!st.resultsUrl) {
+      let results: Map<string, BatchEntryOutcome>;
+      if (st.outcomes) {
+        // OpenRouter returns results inline in the poll response.
+        results = st.outcomes;
+      } else if (st.resultsUrl) {
+        results = await resultsFor(st.resultsUrl);
+      } else {
         job.state = "failed";
-        job.result = { ok: false, error: "batch ended without results_url" };
+        job.result = { ok: false, error: st.error ?? "batch ended without results" };
         saveJob(cwd, job);
         archiveJob(cwd, job);
         resolved.push({ job, outcome: job.result });
         continue;
       }
-      const results = await resultsFor(st.resultsUrl);
       const outcome = results.get(job.id) ?? { ok: false, error: "no result entry for job" };
       job.state = outcome.ok ? "done" : "failed";
       job.lastStatus = "ended";

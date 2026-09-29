@@ -18,7 +18,8 @@ turn_end ──▶ poll goal_events.jsonl (byte-offset diff, O(new events))
           │     ├─ completion_requested    ──▶ GAP audit (Opus lane) ──▶ [STEER:OPUS] before archival
           │     └─ every N turns + plateau ──▶ COVER checks (DeepSeek lane, budget-bounded)
           ──▶ batch monitor (when AUDITGAP_SPEC_BATCH=1): submit queued audits as ONE
-          │    Anthropic Messages Batch, poll status every few turns, route completions
+          │    batch (Anthropic Messages Batches API or OpenRouter Batch API),
+          │    poll status every few turns, route completions
           ──▶ fire-and-forget lane calls; failures notify, never crash
 ```
 
@@ -29,12 +30,23 @@ turn_end ──▶ poll goal_events.jsonl (byte-offset diff, O(new events))
 
 ## Configuration
 
-Copy `.env.example` and set the lane credentials (or export in your shell / pi launch config).
+### Picking models interactively (no env vars needed)
+
+Run `/auditgap-settings` and choose **Select spec model** / **Select cover model**. The command opens the same typeahead-searchable model list as pi's built-in `/model` selector (fuzzy filter across provider, model id, and name), built from pi's own catalogue — every provider and model you already configured via `/login` or `models.json`.
+
+The pick is stored per project in `.pi/audit-gap/settings.json` as `{ provider, modelId }` (no secrets — API keys and base URLs are resolved through pi's ModelRegistry at apply time) and translated into the lane env vars below. A stored selection overrides env for its lane; `/auditgap-settings clear [spec|cover]` removes it and restores your env config. Transport is derived from the model: `anthropic-messages` APIs drive the native Anthropic transport; everything else uses the OpenAI-compatible chat/completions lane. Batch mode stays enabled for Anthropic picks and for OpenAI-compatible picks on an `openrouter.ai` base (the queue dispatches to OpenRouter's Batch API); it is force-disabled only for OpenAI-compatible picks on other bases, where no batch API exists.
+
+Outside the TUI (RPC/JSON/print modes) the picker falls back to pi's flat `select` dialog.
+
+### Environment variables
+
+Copy `.env.example` and set the lane credentials (or export in your shell / pi launch config). Only needed for lanes without a stored `/auditgap-settings` selection.
 
 | Variable | Lane | Required | Notes |
 |----------|------|----------|-------|
-| `AUDITGAP_SPEC_API` | spec | no | `anthropic` (native, **required for batch**) or `openai` (OpenRouter/LiteLLM/proxies). Default `openai` |
-| `AUDITGAP_SPEC_BATCH` | spec | no | `1` = route spec work through the Anthropic Messages Batches API (50% off, minutes-to-hours latency) |
+| `AUDITGAP_SPEC_API` | spec | no | `anthropic` (native) or `openai` (OpenRouter/LiteLLM/proxies). Default `openai`. Drives the **direct** lane |
+| `AUDITGAP_SPEC_BATCH` | spec | no | `1` = route spec work through a batch API (~50% off, minutes-to-hours latency) |
+| `AUDITGAP_SPEC_BATCH_API` | batch | no | `anthropic` (native Messages Batches API, direct Anthropic bases) or `openrouter` (OpenRouter Batch API). **Default: derived** — `openrouter.ai` in `AUDITGAP_SPEC_BASE_URL` → `openrouter`, otherwise `anthropic` |
 | `AUDITGAP_SPEC_BASE_URL` / `AUDITGAP_SPEC_API_KEY` / `AUDITGAP_SPEC_MODEL` | spec | yes* | *falls back to pi-harvest's `VERIFIER_*`. For Anthropic: `https://api.anthropic.com/v1` + `sk-ant-...` |
 | `AUDITGAP_SPEC_MAX_TOKENS` | spec | no | default `8192` (Anthropic requires `max_tokens`) |
 | `AUDITGAP_COVER_BASE_URL` / `AUDITGAP_COVER_API_KEY` / `AUDITGAP_COVER_MODEL` | cover | yes | **always OpenAI-compatible**. DeepSeek direct (`https://api.deepseek.com/v1`) or OpenRouter (`https://openrouter.ai/api/v1` + any model id, e.g. `deepseek/deepseek-chat`) |
@@ -45,10 +57,16 @@ Copy `.env.example` and set the lane credentials (or export in your shell / pi l
 | `AUDITGAP_PLATEAU_SWEEPS` | trigger | no | default `2` stuck sweeps before spec-lane escalation |
 | `AUDITGAP_SPEC_TIMEOUT_MS` / `AUDITGAP_COVER_TIMEOUT_MS` | http | no | defaults `600000` / `120000` |
 | `AUDITGAP_MAX_RETRIES` | http | no | default `2`, backoff 1 s → 2 s on 429/5xx/timeout |
+| `AUDITGAP_DONE_RETENTION_DAYS` | storage | no | days to keep archived checklists in `.pi/audit-gap/done/` (default `30`; `0` = keep forever) |
 
-### Anthropic batch mode
+### Batch mode (Anthropic direct or OpenRouter)
 
-With `AUDITGAP_SPEC_API=anthropic` + `AUDITGAP_SPEC_BATCH=1`, spec-lane audits are spooled durably to `.pi/audit-gap/queue/<job>.json`, grouped into **one** `POST /v1/messages/batches` submission, and polled (`GET /v1/messages/batches/{id}` → signed results URL) every few turns. Completed results feed the same handlers as direct calls — `dod.json` updates and `[STEER:OPUS]` injection happen whenever the batch lands. Terminal jobs archive to `queue/done/`. Manual `/auditgap spec|audit` always uses the direct lane because a human is waiting, and gap audits at `completion_requested` stay latency-critical — batch steers there can arrive after pi-goal-x has archived the goal.
+With `AUDITGAP_SPEC_BATCH=1`, spec-lane audits are spooled durably to `.pi/audit-gap/queue/<job>.json` and grouped into **one** batch submission, polled every few turns. Two submission APIs:
+
+- **Anthropic** (direct Anthropic base URLs): one `POST /v1/messages/batches`, polled via `GET /v1/messages/batches/{id}` → signed results URL.
+- **OpenRouter** (when the spec base URL is `openrouter.ai`, or `AUDITGAP_SPEC_BATCH_API=openrouter`): one `POST /api/v1/batches` with chat-completions-shaped request bodies; OpenRouter returns `202 Accepted` and the poll response carries the results **inline** (no signed URL). The submission tries the plain model id first and retries once with the `:batch` variant if OpenRouter rejects it.
+
+Completed results feed the same handlers as direct calls — `dod.json` updates and `[STEER:*]` injection happen whenever the batch lands. Terminal jobs archive to `queue/done/`. Manual `/auditgap spec|audit` always uses the direct lane because a human is waiting, and gap audits at `completion_requested` stay latency-critical — batch steers there can arrive after pi-goal-x has archived the goal.
 
 ## Relationship to pi-harvest (no duplication)
 
@@ -64,12 +82,19 @@ They share only the steer-injection mechanism and (optionally) env credentials �
 
 ## Slash commands
 
-All under the single `auditgap` namespace:
+Audit pipeline (single `auditgap` namespace):
 
 - `/auditgap status` — turn counter, ledger offset, goal/checklist summary, lane config, last error.
 - `/auditgap spec <goalId>` — manually request a spec audit (DoD checklist generation).
 - `/auditgap audit <goalId>` — manually request a gap audit against the checklist.
 - `/auditgap dod <goalId>` — print the checklist with per-item status.
+
+Lane model selection:
+
+- `/auditgap-settings` — menu: select spec/cover model (searchable picker), show effective config, clear a selection.
+- `/auditgap-settings spec` / `/auditgap-settings cover` — jump straight to the picker for one lane.
+- `/auditgap-settings status` — stored selections + effective env (keys redacted) + spec transport/batch state.
+- `/auditgap-settings clear [spec|cover]` — drop stored selection(s); env config takes over again.
 
 ## TUI widget
 
