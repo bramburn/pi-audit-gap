@@ -23,6 +23,17 @@
  *   (set AUDITGAP_COVER_BASE_URL=https://openrouter.ai/api/v1 and any
  *   OpenRouter model id to spend OpenRouter credits).
  *
+ * - STEER lane (gap audits): the model that produces [STEER:*] gap
+ *   messages at completion_requested / plateau. Optional — every
+ *   AUDITGAP_STEER_* var falls back to the spec lane's config, so without
+ *   a /auditgap-settings steer pick gap audits keep riding the spec lane.
+ *
+ * - BATCH lane (batch runner): the model the batch queue submits jobs as.
+ *   Optional — AUDITGAP_BATCH_* falls back to the spec lane's config. Only
+ *   batch-capable models make sense here (native Anthropic API or an
+ *   openrouter.ai base), so the /auditgap-settings picker filters the
+ *   catalogue accordingly.
+ *
  * Same retry/backoff policy as pi-harvest: exponential 1 s -> 2 s on
  * 429/5xx/timeouts, AuditGapUnavailableError after the final attempt.
  * All lanes return strictly validated JSON — no prose, no fences.
@@ -36,7 +47,7 @@ import {
 } from "./types.js";
 import { buildGapPayload, buildSpecPayload, MAX_PAYLOAD_BYTES } from "./assemble.js";
 
-export type Lane = "spec" | "cover";
+export type Lane = "spec" | "cover" | "steer" | "batch";
 export type Transport = "openai" | "anthropic";
 
 interface LaneConfig {
@@ -54,6 +65,15 @@ export function specTransport(): Transport {
   return raw === "anthropic" ? "anthropic" : "openai";
 }
 
+/**
+ * Select the steer-lane (gap-audit) transport. Defaults to the spec
+ * lane's transport so an unset steer lane rides the spec lane exactly.
+ */
+export function steerTransport(): Transport {
+  const raw = (process.env.AUDITGAP_STEER_API ?? process.env.AUDITGAP_SPEC_API ?? "openai").trim().toLowerCase();
+  return raw === "anthropic" ? "anthropic" : "openai";
+}
+
 /** True when spec-lane work should go through the batch queue. */
 export function specBatchEnabled(): boolean {
   if ((process.env.AUDITGAP_SPEC_BATCH ?? "").trim() !== "1") return false;
@@ -67,40 +87,54 @@ export function specBatchEnabled(): boolean {
 export type BatchApi = "anthropic" | "openrouter";
 
 /**
- * Select the batch API. AUDITGAP_SPEC_BATCH_API is explicit
- * ("openrouter" | "anthropic"); when unset it is derived from the spec
- * base URL so a /auditgap-settings pick of an OpenRouter model batches
- * through OpenRouter without any extra configuration.
+ * Select the batch API. AUDITGAP_BATCH_API (batch-lane pick) or
+ * AUDITGAP_SPEC_BATCH_API (explicit "openrouter" | "anthropic") win; when
+ * unset it is derived from the batch lane base URL (falling back to the
+ * spec base URL) so a /auditgap-settings pick of an OpenRouter model
+ * batches through OpenRouter without any extra configuration.
  */
 export function batchApi(): BatchApi {
-  const raw = (process.env.AUDITGAP_SPEC_BATCH_API ?? "").trim().toLowerCase();
+  const raw = (process.env.AUDITGAP_BATCH_API ?? process.env.AUDITGAP_SPEC_BATCH_API ?? "").trim().toLowerCase();
   if (raw === "openrouter") return "openrouter";
   if (raw === "anthropic") return "anthropic";
-  const base = (process.env.AUDITGAP_SPEC_BASE_URL ?? process.env.VERIFIER_BASE_URL ?? "").toLowerCase();
+  const base = (
+    process.env.AUDITGAP_BATCH_BASE_URL ??
+    process.env.AUDITGAP_SPEC_BASE_URL ??
+    process.env.VERIFIER_BASE_URL ??
+    ""
+  ).toLowerCase();
   return base.includes("openrouter.ai") ? "openrouter" : "anthropic";
 }
 
 function readLaneConfig(lane: Lane): LaneConfig {
-  const prefix = lane === "spec" ? "AUDITGAP_SPEC" : "AUDITGAP_COVER";
-  // Spec lane falls back to pi-harvest's VERIFIER_* so a single
-  // supervisor endpoint can serve both extensions during bring-up.
-  const fallback = lane === "spec";
+  const prefix = "AUDITGAP_" + lane.toUpperCase();
+  // Spec, steer and batch lanes fall back through AUDITGAP_SPEC_* to
+  // pi-harvest's VERIFIER_* so a single supervisor endpoint can serve
+  // every lane during bring-up. Cover is configured (or picked) on its own.
+  const fallback = lane !== "cover";
   const baseUrl =
     process.env[prefix + "_BASE_URL"]?.replace(/\/+$/, "") ??
+    (fallback ? process.env.AUDITGAP_SPEC_BASE_URL?.replace(/\/+$/, "") : undefined) ??
     (fallback ? process.env.VERIFIER_BASE_URL?.replace(/\/+$/, "") : undefined) ??
     "";
   const apiKey =
     process.env[prefix + "_API_KEY"] ??
+    (fallback ? process.env.AUDITGAP_SPEC_API_KEY : undefined) ??
     (fallback ? process.env.VERIFIER_API_KEY : undefined) ??
     "";
   const model =
     process.env[prefix + "_MODEL"] ??
+    (fallback ? process.env.AUDITGAP_SPEC_MODEL : undefined) ??
     (fallback ? process.env.VERIFIER_MODEL : undefined) ??
     "";
-  const defaultTimeout = lane === "spec" ? 600000 : 120000;
-  const timeoutMs = Number(process.env[prefix + "_TIMEOUT_MS"] ?? String(defaultTimeout));
+  const defaultTimeout = lane === "cover" ? 120000 : 600000;
+  const laneTimeout = process.env[prefix + "_TIMEOUT_MS"];
+  const specTimeout = lane === "steer" || lane === "batch" ? process.env.AUDITGAP_SPEC_TIMEOUT_MS : undefined;
+  const timeoutMs = Number(laneTimeout ?? specTimeout ?? String(defaultTimeout));
   const retries = Number(process.env.AUDITGAP_MAX_RETRIES ?? "2");
-  const maxTokens = Number(process.env[prefix + "_MAX_TOKENS"] ?? "8192");
+  const laneMaxTokens = process.env[prefix + "_MAX_TOKENS"];
+  const specMaxTokens = lane === "steer" || lane === "batch" ? process.env.AUDITGAP_SPEC_MAX_TOKENS : undefined;
+  const maxTokens = Number(laneMaxTokens ?? specMaxTokens ?? "8192");
   const missing: string[] = [];
   if (!baseUrl) missing.push(prefix + "_BASE_URL");
   if (!apiKey) missing.push(prefix + "_API_KEY");
@@ -430,9 +464,10 @@ async function anthropicMessage(cfg: LaneConfig, systemPrompt: string, userConte
   return parseAnthropicText(payload);
 }
 
-/** Raw call dispatcher for the spec lane. */
-function specRawCall(cfg: LaneConfig, systemPrompt: string, userContent: string): () => Promise<string> {
-  if (specTransport() === "anthropic") {
+/** Raw call dispatcher for the spec and steer lanes. */
+function specRawCall(cfg: LaneConfig, systemPrompt: string, userContent: string, transport?: Transport): () => Promise<string> {
+  const api = transport ?? specTransport();
+  if (api === "anthropic") {
     return () => anthropicMessage(cfg, systemPrompt, userContent);
   }
   return () => openAiChatCompletion(cfg, systemPrompt, userContent);
@@ -454,7 +489,7 @@ export interface BatchSubmissionResult {
 /** POST /v1/messages/batches — submit up to 10k requests in one batch. */
 export async function anthropicSubmitBatch(entries: BatchRequestEntry[]): Promise<BatchSubmissionResult> {
   if (entries.length === 0) throw new Error("no batch entries to submit");
-  const cfg = readLaneConfig("spec");
+  const cfg = readLaneConfig("batch");
   const body = {
     requests: entries.map((e) => ({ custom_id: e.customId, params: e.params })),
   };
@@ -500,7 +535,7 @@ export interface BatchStatusResult {
 
 /** GET /v1/messages/batches/{id} — poll processing state. */
 export async function anthropicBatchStatus(batchId: string): Promise<BatchStatusResult> {
-  const cfg = readLaneConfig("spec");
+  const cfg = readLaneConfig("batch");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
   let res: Response;
@@ -585,7 +620,7 @@ export function parseBatchResults(body: string): Map<string, BatchEntryOutcome> 
 
 /** GET the signed results URL. No auth headers — the URL is pre-signed. */
 export async function fetchBatchResults(resultsUrl: string): Promise<Map<string, BatchEntryOutcome>> {
-  const cfg = readLaneConfig("spec");
+  const cfg = readLaneConfig("batch");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
   let res: Response;
@@ -656,7 +691,7 @@ export function buildOpenRouterBatchPayload(entries: BatchRequestEntry[], model:
 /** POST {base}/batches — submit all queued jobs as one OpenRouter batch. */
 export async function openrouterSubmitBatch(entries: BatchRequestEntry[]): Promise<BatchSubmissionResult> {
   if (entries.length === 0) throw new Error("no batch entries to submit");
-  const cfg = readLaneConfig("spec");
+  const cfg = readLaneConfig("batch");
   const url = cfg.baseUrl.replace(/\/+$/, "") + "/batches";
   const modelsToTry = cfg.model.trim().endsWith(":batch") ? [cfg.model] : [cfg.model, cfg.model + ":batch"];
   for (const model of modelsToTry) {
@@ -767,7 +802,7 @@ export function parseOpenRouterBatchStatus(payload: unknown): BatchStatusResult 
 
 /** GET {base}/batches/{id} — poll processing state; results are inline. */
 export async function openrouterBatchStatus(batchId: string): Promise<BatchStatusResult> {
-  const cfg = readLaneConfig("spec");
+  const cfg = readLaneConfig("batch");
   const url = cfg.baseUrl.replace(/\/+$/, "") + "/batches/" + encodeURIComponent(batchId);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
@@ -804,8 +839,8 @@ export async function invokeSpecAudit(input: { objective: string; cwd: string })
 
 /** Spec lane: completion_requested / plateau -> gap audit against the checklist. */
 export async function invokeGapAudit(input: { checklist: import("./types.js").DodChecklist; cwd: string }): Promise<GapAuditResponse> {
-  const cfg = readLaneConfig("spec");
-  return callAndParse("spec", specRawCall(cfg, GAP_SYSTEM_PROMPT, buildGapPayload(input)), validateGapAuditResponse);
+  const cfg = readLaneConfig("steer");
+  return callAndParse("steer", specRawCall(cfg, GAP_SYSTEM_PROMPT, buildGapPayload(input), steerTransport()), validateGapAuditResponse);
 }
 
 /** Cover lane: one checklist item -> pass/fail/unknown. OpenAI-compatible always. */

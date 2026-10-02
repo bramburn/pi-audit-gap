@@ -4,8 +4,8 @@
  * Same tagging discipline as pi-harvest: every synthetic supervision
  * message starts with `[STEER:<PROVIDER>]` so downstream slicers classify
  * it as Tier 3 (supervisor), never a user prompt. Provider tags come
- * from AUDITGAP_SPEC_PROVIDER / AUDITGAP_COVER_PROVIDER (uppercased,
- * sanitized), defaulting to OPUS / DS.
+ * from AUDITGAP_SPEC_PROVIDER / AUDITGAP_STEER_PROVIDER /
+ * AUDITGAP_COVER_PROVIDER (uppercased, sanitized), defaulting to OPUS / DS.
  *
  * Steers POINT AT the dod.json artifact rather than duplicating its
  * state — the checklist file is the source of truth (a weak worker model
@@ -16,15 +16,21 @@ import type { DodChecklist, DodItem } from "./types.js";
 
 const MAX_STEER_BYTES = 16 * 1024;
 
-export function steerProviderTag(lane: "spec" | "cover"): string {
-  const envKey = lane === "spec" ? "AUDITGAP_SPEC_PROVIDER" : "AUDITGAP_COVER_PROVIDER";
-  const fallback = lane === "spec" ? "OPUS" : "DS";
-  const raw = (process.env[envKey] ?? fallback).trim().toUpperCase();
+export function steerProviderTag(lane: "spec" | "cover" | "steer"): string {
+  const envKey = lane === "spec" ? "AUDITGAP_SPEC_PROVIDER" : lane === "cover" ? "AUDITGAP_COVER_PROVIDER" : "AUDITGAP_STEER_PROVIDER";
+  const fallback = lane === "spec" || lane === "steer" ? "OPUS" : "DS";
+  // The steer (gap-audit) lane rides the spec lane when it has no own
+  // pick, so its provider tag falls back to the spec provider tag.
+  const raw = (
+    process.env[envKey] ??
+    (lane === "steer" ? process.env.AUDITGAP_SPEC_PROVIDER : undefined) ??
+    fallback
+  ).trim().toUpperCase();
   const sanitized = raw.replace(/[^A-Z0-9_-]/g, "");
   return sanitized.length > 0 ? sanitized : fallback;
 }
 
-export function steerPrefix(lane: "spec" | "cover", subLabel?: string): string {
+export function steerPrefix(lane: "spec" | "cover" | "steer", subLabel?: string): string {
   const sub = subLabel?.trim();
   return "[STEER:" + steerProviderTag(lane) + "]" + (sub ? "[" + sub + "]" : "");
 }
@@ -71,7 +77,7 @@ export function buildGapSteerBody(
   const failed = checklist.items.filter((i) => i.status === "failed");
   const pending = checklist.items.filter((i) => i.status === "pending");
   const lines: string[] = [];
-  lines.push(steerPrefix("spec", "GAP AUDIT"));
+  lines.push(steerPrefix("steer", "GAP AUDIT"));
   lines.push("Goal completion requested, but coverage gaps remain — DO NOT stop yet.");
   if (summary) lines.push("Auditor summary: " + summary);
   if (failed.length > 0) {

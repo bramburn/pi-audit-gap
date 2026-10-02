@@ -46,6 +46,8 @@ export interface AuditGapSettings {
   version: 1;
   updatedAt: string;
   spec?: LaneModelSelection;
+  steer?: LaneModelSelection;
+  batch?: LaneModelSelection;
   cover?: LaneModelSelection;
 }
 
@@ -67,7 +69,7 @@ export function loadSettings(cwd: string): AuditGapSettings | null {
     version: 1,
     updatedAt: typeof obj.updatedAt === "string" ? obj.updatedAt : "",
   };
-  for (const lane of ["spec", "cover"] as const) {
+  for (const lane of ["spec", "steer", "batch", "cover"] as const) {
     const sel = obj[lane];
     if (!sel || typeof sel !== "object") continue;
     const s = sel as Record<string, unknown>;
@@ -87,6 +89,8 @@ export function saveSettings(cwd: string, lanes: Partial<AuditGapSettings>): Aud
     version: 1,
     updatedAt: new Date().toISOString(),
     ...(lanes.spec ? { spec: lanes.spec } : {}),
+    ...(lanes.steer ? { steer: lanes.steer } : {}),
+    ...(lanes.batch ? { batch: lanes.batch } : {}),
     ...(lanes.cover ? { cover: lanes.cover } : {}),
   };
   atomicWriteJson(settingsPath(cwd), next);
@@ -163,6 +167,20 @@ const LANE_ENV_KEYS: Record<Lane, string[]> = {
     "AUDITGAP_SPEC_API",
     "AUDITGAP_SPEC_BATCH",
   ],
+  steer: [
+    "AUDITGAP_STEER_BASE_URL",
+    "AUDITGAP_STEER_API_KEY",
+    "AUDITGAP_STEER_MODEL",
+    "AUDITGAP_STEER_PROVIDER",
+    "AUDITGAP_STEER_API",
+  ],
+  batch: [
+    "AUDITGAP_BATCH_BASE_URL",
+    "AUDITGAP_BATCH_API_KEY",
+    "AUDITGAP_BATCH_MODEL",
+    "AUDITGAP_BATCH_PROVIDER",
+    "AUDITGAP_BATCH_API",
+  ],
   cover: [
     "AUDITGAP_COVER_BASE_URL",
     "AUDITGAP_COVER_API_KEY",
@@ -191,27 +209,40 @@ export function restoreLaneEnv(lane: Lane): boolean {
 }
 
 function applyLaneEnv(lane: Lane, sel: LaneModelSelection, baseUrl: string, apiKey: string, api: string): void {
-  const prefix = lane === "spec" ? "AUDITGAP_SPEC" : "AUDITGAP_COVER";
+  const prefix = "AUDITGAP_" + lane.toUpperCase();
   for (const key of LANE_ENV_KEYS[lane]) rememberOriginal(key);
   process.env[prefix + "_BASE_URL"] = baseUrl;
   process.env[prefix + "_API_KEY"] = apiKey;
   process.env[prefix + "_MODEL"] = sel.modelId;
   process.env[prefix + "_PROVIDER"] = sel.tag && sel.tag.trim() ? sel.tag : deriveTag(sel.provider);
-  if (lane === "spec") {
+  if (lane === "spec" || lane === "steer") {
     const transport = api.includes("anthropic") ? "anthropic" : "openai";
-    process.env.AUDITGAP_SPEC_API = transport;
-    if (transport === "openai" && !baseUrl.includes("openrouter.ai")) {
-      // The batch queue's native Anthropic transport only works against
-      // Anthropic-direct bases — never leave it enabled elsewhere.
-      // OpenRouter bases are fine: the queue dispatches to OpenRouter's
-      // own Batch API there, so the user's batch flag stays meaningful.
-      process.env.AUDITGAP_SPEC_BATCH = "0";
+    process.env[prefix + "_API"] = transport;
+    if (lane === "spec") {
+      if (transport === "openai" && !baseUrl.includes("openrouter.ai")) {
+        // The batch queue's native Anthropic transport only works against
+        // Anthropic-direct bases — never leave it enabled elsewhere.
+        // OpenRouter bases are fine: the queue dispatches to OpenRouter's
+        // own Batch API there, so the user's batch flag stays meaningful.
+        process.env.AUDITGAP_SPEC_BATCH = "0";
+      } else {
+        // Anthropic or OpenRouter transport: hand batch control back to
+        // the user's env.
+        const originalBatch = originalEnv.get("AUDITGAP_SPEC_BATCH");
+        if (originalBatch === undefined) delete process.env.AUDITGAP_SPEC_BATCH;
+        else process.env.AUDITGAP_SPEC_BATCH = originalBatch;
+      }
+    }
+  } else if (lane === "batch") {
+    // The batch queue only speaks the native Anthropic Messages Batches
+    // API and OpenRouter's Batch API — record which one this model needs
+    // so batchApi() dispatches without re-deriving from the base URL.
+    if (api.includes("anthropic")) {
+      process.env.AUDITGAP_BATCH_API = "anthropic";
+    } else if (baseUrl.includes("openrouter.ai")) {
+      process.env.AUDITGAP_BATCH_API = "openrouter";
     } else {
-      // Anthropic or OpenRouter transport: hand batch control back to
-      // the user's env.
-      const originalBatch = originalEnv.get("AUDITGAP_SPEC_BATCH");
-      if (originalBatch === undefined) delete process.env.AUDITGAP_SPEC_BATCH;
-      else process.env.AUDITGAP_SPEC_BATCH = originalBatch;
+      delete process.env.AUDITGAP_BATCH_API;
     }
   }
 }
@@ -237,7 +268,7 @@ export interface LaneApplyResult {
 export async function applyLaneSelections(cwd: string, registry: ModelRegistryLike | undefined): Promise<LaneApplyResult[]> {
   const settings = loadSettings(cwd);
   const results: LaneApplyResult[] = [];
-  for (const lane of ["spec", "cover"] as const) {
+  for (const lane of ["spec", "steer", "batch", "cover"] as const) {
     const sel = settings?.[lane];
     if (!sel) {
       const restored = restoreLaneEnv(lane);

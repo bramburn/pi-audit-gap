@@ -30,11 +30,18 @@ function sampleChecklist(overrides?: Partial<DodChecklist>): DodChecklist {
 test("steerProviderTag honors env and sanitizes", () => {
   delete process.env.AUDITGAP_SPEC_PROVIDER;
   delete process.env.AUDITGAP_COVER_PROVIDER;
+  delete process.env.AUDITGAP_STEER_PROVIDER;
   assert.equal(steerProviderTag("spec"), "OPUS");
   assert.equal(steerProviderTag("cover"), "DS");
+  assert.equal(steerProviderTag("steer"), "OPUS");
   process.env.AUDITGAP_SPEC_PROVIDER = "claude opus 5.5!";
   assert.equal(steerProviderTag("spec"), "CLAUDEOPUS55");
+  // Steer lane rides the spec provider tag until it gets its own pick.
+  assert.equal(steerProviderTag("steer"), "CLAUDEOPUS55");
+  process.env.AUDITGAP_STEER_PROVIDER = "kimi k3";
+  assert.equal(steerProviderTag("steer"), "KIMIK3");
   delete process.env.AUDITGAP_SPEC_PROVIDER;
+  delete process.env.AUDITGAP_STEER_PROVIDER;
 });
 
 test("steerPrefix builds the Tier-3 tag", () => {

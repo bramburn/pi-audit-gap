@@ -24,6 +24,16 @@ const LANE_KEYS = [
   "AUDITGAP_SPEC_PROVIDER",
   "AUDITGAP_SPEC_API",
   "AUDITGAP_SPEC_BATCH",
+  "AUDITGAP_STEER_BASE_URL",
+  "AUDITGAP_STEER_API_KEY",
+  "AUDITGAP_STEER_MODEL",
+  "AUDITGAP_STEER_PROVIDER",
+  "AUDITGAP_STEER_API",
+  "AUDITGAP_BATCH_BASE_URL",
+  "AUDITGAP_BATCH_API_KEY",
+  "AUDITGAP_BATCH_MODEL",
+  "AUDITGAP_BATCH_PROVIDER",
+  "AUDITGAP_BATCH_API",
   "AUDITGAP_COVER_BASE_URL",
   "AUDITGAP_COVER_API_KEY",
   "AUDITGAP_COVER_MODEL",
@@ -78,10 +88,14 @@ test("settings file roundtrip and path", () => {
     assert.equal(loadSettings(cwd), null);
     setLaneSelection(cwd, "cover", { provider: "openrouter", modelId: "deepseek/deepseek-chat" });
     setLaneSelection(cwd, "spec", { provider: "anthropic", modelId: "claude-opus-5-5", tag: "OPUS" });
+    setLaneSelection(cwd, "steer", { provider: "anthropic", modelId: "claude-opus-5-5" });
+    setLaneSelection(cwd, "batch", { provider: "openrouter", modelId: "moonshot/kimi-k3" });
     const loaded = loadSettings(cwd);
     assert.equal(loaded?.cover?.provider, "openrouter");
     assert.equal(loaded?.cover?.modelId, "deepseek/deepseek-chat");
     assert.equal(loaded?.spec?.tag, "OPUS");
+    assert.equal(loaded?.steer?.provider, "anthropic");
+    assert.equal(loaded?.batch?.modelId, "moonshot/kimi-k3");
     assert.ok(fs.existsSync(settingsPath(cwd)));
     assert.ok(settingsPath(cwd).includes(path.join(".pi", "audit-gap")));
   } finally {
@@ -109,15 +123,17 @@ test("loadSettings tolerates corrupt files and rejects other versions", () => {
   }
 });
 
-test("setLaneSelection clears a lane and keeps the other", () => {
+test("setLaneSelection clears a lane and keeps the others", () => {
   const cwd = tmpCwd();
   try {
     setLaneSelection(cwd, "cover", { provider: "openrouter", modelId: "deepseek/deepseek-chat" });
     setLaneSelection(cwd, "spec", { provider: "anthropic", modelId: "claude-opus-5-5" });
+    setLaneSelection(cwd, "steer", { provider: "anthropic", modelId: "claude-opus-5-5" });
     setLaneSelection(cwd, "spec", undefined);
     const loaded = loadSettings(cwd);
     assert.equal(loaded?.spec, undefined);
     assert.equal(loaded?.cover?.provider, "openrouter");
+    assert.equal(loaded?.steer?.provider, "anthropic");
   } finally {
     fs.rmSync(cwd, { recursive: true, force: true });
   }
@@ -189,6 +205,77 @@ test("applyLaneSelections picks the transport from the model api and gates batch
   }
 });
 
+test("applyLaneSelections maps the steer lane onto env vars with spec-lane fallback", async () => {
+  const snap = snapshotEnv();
+  const cwd = tmpCwd();
+  resetLaneEnvSnapshots();
+  try {
+    process.env.AUDITGAP_SPEC_MODEL = "env-spec-model";
+    process.env.AUDITGAP_SPEC_BASE_URL = "https://api.anthropic.com/v1";
+    process.env.AUDITGAP_SPEC_API_KEY = "sk-spec";
+    process.env.AUDITGAP_SPEC_API = "anthropic";
+    // No steer selection: steer lane env stays unset, so invokeGapAudit
+    // falls back to the spec config.
+    let results = await applyLaneSelections(cwd, fakeRegistry());
+    assert.equal(results.find((r) => r.lane === "steer")?.status, "restored");
+    assert.equal(process.env.AUDITGAP_STEER_MODEL, undefined);
+
+    // Steer pick: own env vars, transport derived from the model api.
+    setLaneSelection(cwd, "steer", { provider: "anthropic", modelId: "claude-opus-5-5" });
+    results = await applyLaneSelections(cwd, fakeRegistry());
+    assert.equal(results.find((r) => r.lane === "steer")?.status, "applied");
+    assert.equal(process.env.AUDITGAP_STEER_MODEL, "claude-opus-5-5");
+    assert.equal(process.env.AUDITGAP_STEER_BASE_URL, "https://api.anthropic.com/v1");
+    assert.equal(process.env.AUDITGAP_STEER_API_KEY, "sk-test-123");
+    assert.equal(process.env.AUDITGAP_STEER_PROVIDER, "ANTHROPIC");
+    assert.equal(process.env.AUDITGAP_STEER_API, "anthropic");
+    // Spec lane untouched by the steer pick.
+    assert.equal(process.env.AUDITGAP_SPEC_MODEL, "env-spec-model");
+
+    // Clear: steer env vars restored to the pre-override (unset) state.
+    setLaneSelection(cwd, "steer", undefined);
+    await applyLaneSelections(cwd, fakeRegistry());
+    assert.equal(process.env.AUDITGAP_STEER_MODEL, undefined);
+  } finally {
+    restoreEnv(snap);
+    resetLaneEnvSnapshots();
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("applyLaneSelections maps the batch lane and records the batch API", async () => {
+  const snap = snapshotEnv();
+  const cwd = tmpCwd();
+  resetLaneEnvSnapshots();
+  try {
+    // Anthropic pick -> native Messages Batches API.
+    setLaneSelection(cwd, "batch", { provider: "anthropic", modelId: "claude-opus-5-5" });
+    let results = await applyLaneSelections(cwd, fakeRegistry());
+    assert.equal(results.find((r) => r.lane === "batch")?.status, "applied");
+    assert.equal(process.env.AUDITGAP_BATCH_MODEL, "claude-opus-5-5");
+    assert.equal(process.env.AUDITGAP_BATCH_API, "anthropic");
+
+    // OpenRouter pick -> OpenRouter Batch API.
+    setLaneSelection(cwd, "batch", { provider: "openrouter", modelId: "deepseek/deepseek-chat" });
+    results = await applyLaneSelections(cwd, fakeRegistry());
+    assert.equal(results.find((r) => r.lane === "batch")?.status, "applied");
+    assert.equal(process.env.AUDITGAP_BATCH_MODEL, "deepseek/deepseek-chat");
+    assert.equal(process.env.AUDITGAP_BATCH_BASE_URL, "https://openrouter.ai/api/v1");
+    assert.equal(process.env.AUDITGAP_BATCH_API, "openrouter");
+
+    // Clear: batch env restored, spec/cover lanes unaffected.
+    setLaneSelection(cwd, "batch", undefined);
+    results = await applyLaneSelections(cwd, fakeRegistry());
+    assert.equal(results.find((r) => r.lane === "batch")?.status, "restored");
+    assert.equal(process.env.AUDITGAP_BATCH_MODEL, undefined);
+  } finally {
+    restoreEnv(snap);
+    resetLaneEnvSnapshots();
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+
 test("applyLaneSelections restores original env when selection is cleared or model is missing", async () => {
   const snap = snapshotEnv();
   const cwd = tmpCwd();
@@ -230,6 +317,8 @@ test("restoreLaneEnv is a no-op when the lane was never overridden", () => {
   resetLaneEnvSnapshots();
   try {
     assert.equal(restoreLaneEnv("spec"), false);
+    assert.equal(restoreLaneEnv("steer"), false);
+    assert.equal(restoreLaneEnv("batch"), false);
     assert.equal(restoreLaneEnv("cover"), false);
   } finally {
     restoreEnv(snap);
@@ -297,6 +386,32 @@ test("pickLaneModel filters to chat models with auth and maps the choice back", 
   assert.equal(choice?.modelId, "claude-opus-5-5");
   assert.ok(selectTitle.includes("spec"));
 });
+
+test("pickLaneModel filters to batch-capable models for the batch lane", async () => {
+  const catalog = {
+    getModelsOfType: () => [
+      { id: "claude-opus-5-5", provider: "anthropic", api: "anthropic-messages" },
+      { id: "deepseek/deepseek-chat", provider: "openrouter", api: "openai-completions", baseUrl: "https://openrouter.ai/api/v1" },
+      { id: "deepseek-chat", provider: "deepseek", api: "openai-completions", baseUrl: "https://api.deepseek.com/v1" },
+    ],
+    hasConfiguredAuth: () => true,
+  };
+  let seenOptions: string[] = [];
+  const ctx = {
+    mode: "print",
+    ui: {
+      select: async (_title: string, options: string[]) => {
+        seenOptions = options;
+        return options[0];
+      },
+      custom: async () => undefined,
+    },
+  };
+  const choice = await pickLaneModel(ctx, catalog, "batch", { batchCapableOnly: true });
+  assert.deepEqual(seenOptions, ["anthropic/claude-opus-5-5", "openrouter/deepseek/deepseek-chat"]);
+  assert.equal(choice?.provider, "anthropic");
+});
+
 
 test("pickLaneModel returns undefined on empty catalogue or cancel", async () => {
   const empty = await pickLaneModel(

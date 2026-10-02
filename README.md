@@ -32,9 +32,16 @@ turn_end ──▶ poll goal_events.jsonl (byte-offset diff, O(new events))
 
 ### Picking models interactively (no env vars needed)
 
-Run `/auditgap-settings` and choose **Select spec model** / **Select cover model**. The command opens the same typeahead-searchable model list as pi's built-in `/model` selector (fuzzy filter across provider, model id, and name), built from pi's own catalogue — every provider and model you already configured via `/login` or `models.json`.
+Run `/auditgap-settings` to open the settings menu and choose **Select spec model**, **Select steer model**, **Select batch runner model**, or **Select cover model**. Each entry opens the same typeahead-searchable model list as pi's built-in `/model` selector (fuzzy filter across provider, model id, and name), built from pi's own catalogue — every provider and model you already configured via `/login` or `models.json`. After a pick the menu reopens, so several lanes can be configured in one pass; choose **Done** (or press Esc) to exit.
 
-The pick is stored per project in `.pi/audit-gap/settings.json` as `{ provider, modelId }` (no secrets — API keys and base URLs are resolved through pi's ModelRegistry at apply time) and translated into the lane env vars below. A stored selection overrides env for its lane; `/auditgap-settings clear [spec|cover]` removes it and restores your env config. Transport is derived from the model: `anthropic-messages` APIs drive the native Anthropic transport; everything else uses the OpenAI-compatible chat/completions lane. Batch mode stays enabled for Anthropic picks and for OpenAI-compatible picks on an `openrouter.ai` base (the queue dispatches to OpenRouter's Batch API); it is force-disabled only for OpenAI-compatible picks on other bases, where no batch API exists.
+The four lanes:
+
+- **spec** (Opus lane): requirement elicitation at `goal_created` — the DoD checklist generator.
+- **steer** (gap-audit lane): the model that audits coverage at `completion_requested` / plateau and authors the `[STEER:*]` gap messages. Optional — with no pick, gap audits keep riding the **spec** model.
+- **batch runner**: the model batch-queued audits are submitted as when `AUDITGAP_SPEC_BATCH=1`. Optional — with no pick, batch jobs use the **spec** model. The picker only lists batch-capable models: native Anthropic-API models and anything served from an `openrouter.ai` base (OpenRouter Batch API), so e.g. `claude-opus-5-5` direct or `moonshot/kimi-k3` via OpenRouter.
+- **cover** (cheap lane): per-item pass/fail verification sweeps.
+
+The pick is stored per project in `.pi/audit-gap/settings.json` as `{ provider, modelId }` (no secrets — API keys and base URLs are resolved through pi's ModelRegistry at apply time) and translated into the lane env vars below. A stored selection overrides env for its lane; `/auditgap-settings clear [spec|steer|batch|cover]` removes it and restores your env config. Transport is derived from the model: `anthropic-messages` APIs drive the native Anthropic transport; everything else uses the OpenAI-compatible chat/completions lane. Batch mode stays enabled for Anthropic picks and for OpenAI-compatible picks on an `openrouter.ai` base (the queue dispatches to OpenRouter's Batch API); it is force-disabled only for OpenAI-compatible spec picks on other bases, where no batch API exists.
 
 Outside the TUI (RPC/JSON/print modes) the picker falls back to pi's flat `select` dialog.
 
@@ -49,6 +56,12 @@ Copy `.env.example` and set the lane credentials (or export in your shell / pi l
 | `AUDITGAP_SPEC_BATCH_API` | batch | no | `anthropic` (native Messages Batches API, direct Anthropic bases) or `openrouter` (OpenRouter Batch API). **Default: derived** — `openrouter.ai` in `AUDITGAP_SPEC_BASE_URL` → `openrouter`, otherwise `anthropic` |
 | `AUDITGAP_SPEC_BASE_URL` / `AUDITGAP_SPEC_API_KEY` / `AUDITGAP_SPEC_MODEL` | spec | yes* | *falls back to pi-harvest's `VERIFIER_*`. For Anthropic: `https://api.anthropic.com/v1` + `sk-ant-...` |
 | `AUDITGAP_SPEC_MAX_TOKENS` | spec | no | default `8192` (Anthropic requires `max_tokens`) |
+| `AUDITGAP_STEER_BASE_URL` / `AUDITGAP_STEER_API_KEY` / `AUDITGAP_STEER_MODEL` | steer | no | gap-audit / `[STEER:*]` lane. **Every var falls back to the spec lane's**, so gap audits ride the spec model unless you pick (or set) a steer model |
+| `AUDITGAP_STEER_API` | steer | no | `anthropic` or `openai`; default: the spec lane's transport |
+| `AUDITGAP_STEER_PROVIDER` | steer tag | no | `[STEER:*]` provider tag; default: the spec provider tag (`OPUS`) |
+| `AUDITGAP_BATCH_BASE_URL` / `AUDITGAP_BATCH_API_KEY` / `AUDITGAP_BATCH_MODEL` | batch | no | batch-runner credentials. **Every var falls back to the spec lane's**; only batch-capable endpoints make sense (Anthropic direct or `openrouter.ai`) |
+| `AUDITGAP_BATCH_API` | batch | no | `anthropic` or `openrouter`; set automatically by a batch-lane pick, derived from the base URL otherwise |
+| `AUDITGAP_BATCH_MAX_TOKENS` | batch | no | default: the spec lane's `AUDITGAP_SPEC_MAX_TOKENS` (`8192`) |
 | `AUDITGAP_COVER_BASE_URL` / `AUDITGAP_COVER_API_KEY` / `AUDITGAP_COVER_MODEL` | cover | yes | **always OpenAI-compatible**. DeepSeek direct (`https://api.deepseek.com/v1`) or OpenRouter (`https://openrouter.ai/api/v1` + any model id, e.g. `deepseek/deepseek-chat`) |
 | `AUDITGAP_SPEC_PROVIDER` / `AUDITGAP_COVER_PROVIDER` | steer tag | no | default `OPUS` / `DS` → `[STEER:OPUS]`, `[STEER:DS]` |
 | `AUDITGAP_BATCH_POLL_EVERY_TURNS` / `AUDITGAP_BATCH_POLL_MIN_SECS` | batch | no | defaults `5` turns / `60` s between batch status polls |
@@ -61,7 +74,7 @@ Copy `.env.example` and set the lane credentials (or export in your shell / pi l
 
 ### Batch mode (Anthropic direct or OpenRouter)
 
-With `AUDITGAP_SPEC_BATCH=1`, spec-lane audits are spooled durably to `.pi/audit-gap/queue/<job>.json` and grouped into **one** batch submission, polled every few turns. Two submission APIs:
+With `AUDITGAP_SPEC_BATCH=1`, spec-lane audits are spooled durably to `.pi/audit-gap/queue/<job>.json` and grouped into **one** batch submission, polled every few turns. All queued jobs are submitted as the **batch-runner model** (`/auditgap-settings` → *Select batch runner model*, or `AUDITGAP_BATCH_*`, falling back to the spec lane). Two submission APIs:
 
 - **Anthropic** (direct Anthropic base URLs): one `POST /v1/messages/batches`, polled via `GET /v1/messages/batches/{id}` → signed results URL.
 - **OpenRouter** (when the spec base URL is `openrouter.ai`, or `AUDITGAP_SPEC_BATCH_API=openrouter`): one `POST /api/v1/batches` with chat-completions-shaped request bodies; OpenRouter returns `202 Accepted` and the poll response carries the results **inline** (no signed URL). The submission tries the plain model id first and retries once with the `:batch` variant if OpenRouter rejects it.
@@ -91,10 +104,10 @@ Audit pipeline (single `auditgap` namespace):
 
 Lane model selection:
 
-- `/auditgap-settings` — menu: select spec/cover model (searchable picker), show effective config, clear a selection.
-- `/auditgap-settings spec` / `/auditgap-settings cover` — jump straight to the picker for one lane.
-- `/auditgap-settings status` — stored selections + effective env (keys redacted) + spec transport/batch state.
-- `/auditgap-settings clear [spec|cover]` — drop stored selection(s); env config takes over again.
+- `/auditgap-settings` — settings menu: select spec / steer / batch-runner / cover model (each opens the same searchable picker as `/model`), show effective config, clear a selection. After a pick the menu reopens; **Done** or Esc exits.
+- `/auditgap-settings spec` / `/auditgap-settings steer` / `/auditgap-settings batch` / `/auditgap-settings cover` — jump straight to the picker for one lane.
+- `/auditgap-settings status` — stored selections + effective env (keys redacted) + transport/batch state.
+- `/auditgap-settings clear [spec|steer|batch|cover]` — drop stored selection(s); env config takes over again.
 
 ## TUI widget
 
@@ -115,7 +128,7 @@ Requires [`pi-goal-x`](https://github.com/bramburn/pi-goal-x) to be installed �
 
 ```bash
 npm install
-npm test   # 46 unit tests across ledger/dod/trigger/steer/batch
+npm test   # unit tests across ledger/dod/trigger/steer/batch/settings
 npm run build  # tsc → dist/
 ```
 

@@ -287,22 +287,32 @@ export interface LaneModelChoice {
  * Show the searchable model picker over pi's catalogue (the same models
  * /model knows about, restricted to chat models with configured auth).
  * Resolves to the picked model, or undefined on cancel / empty catalogue.
+ *
+ * When `batchCapableOnly` is set (the batch-runner lane), the catalogue is
+ * further restricted to models the batch queue can actually submit:
+ * native Anthropic-API models and anything served from an openrouter.ai
+ * base URL (OpenRouter Batch API).
  */
 export async function pickLaneModel(
   ctx: PickerContext,
   catalog: ModelCatalog | undefined,
   lane: string,
+  opts?: { batchCapableOnly?: boolean },
 ): Promise<LaneModelChoice | undefined> {
   const all =
     typeof catalog?.getModelsOfType === "function"
       ? [...catalog.getModelsOfType("chat")]
       : [...(catalog?.getAvailable?.() ?? [])];
+  const batchCapable = (m: ModelCatalogEntry): boolean =>
+    (typeof m.api === "string" && m.api.includes("anthropic")) ||
+    (typeof m.baseUrl === "string" && m.baseUrl.includes("openrouter.ai"));
   const models = all.filter(
     (m) =>
       !!m &&
       typeof m.id === "string" &&
       typeof m.provider === "string" &&
       (m.type === undefined || m.type === "chat") &&
+      (!opts?.batchCapableOnly || batchCapable(m)) &&
       (typeof catalog?.hasConfiguredAuth !== "function" || catalog.hasConfiguredAuth(m)),
   );
   if (models.length === 0) return undefined;
